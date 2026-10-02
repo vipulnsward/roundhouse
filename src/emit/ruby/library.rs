@@ -2195,6 +2195,32 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
     // whether some unrelated file existed.
     let helper_modules: BTreeSet<ClassId> =
         app.helper_method_index.values().cloned().collect();
+    let mut helper_bridges = HashMap::new();
+    for lc in &app.library_classes {
+        if app.controllers.iter().any(|c| c.name == lc.name) {
+            continue;
+        }
+        let mut names: std::collections::HashSet<Symbol> =
+            lc.methods.iter().map(|m| m.name.clone()).collect();
+        for m in &lc.methods {
+            if app.helper_method_index.get(&m.name) != Some(&lc.name)
+                || m.receiver != MethodReceiver::Instance
+                || m.visibility == MethodVisibility::Public
+            {
+                continue;
+            }
+            let stem = m.name.as_str().trim_end_matches(['!', '?', '=']);
+            let mut ordinal = 0;
+            let name = loop {
+                let name = Symbol::from(format!("__rh_view_{stem}_{ordinal}"));
+                if names.insert(name.clone()) {
+                    break name;
+                }
+                ordinal += 1;
+            };
+            helper_bridges.insert(m.name.clone(), name);
+        }
+    }
     // Generated route-helper names (`active_path`, `story_path`, …) —
     // bare calls to these in layout/helper bodies resolve to the
     // generated `RouteHelpers` module. (The view walker rewrites route
@@ -2228,6 +2254,20 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
         // from the controller lowering itself).
         let is_helper_module = helper_modules.contains(&lc.name)
             && !app.controllers.iter().any(|c| c.name == lc.name);
+        if is_helper_module {
+            let bridges: Vec<_> = lc.methods.iter()
+                .filter(|m| app.helper_method_index.get(&m.name) == Some(&lc.name))
+                .filter_map(|m| helper_bridges.get(&m.name).map(|bridge| {
+                    let mut bridge_body = m.clone();
+                    bridge_body.name = bridge.clone();
+                    bridge_body.name_span = Span::synthetic();
+                    bridge_body.receiver = MethodReceiver::Class;
+                    bridge_body.visibility = MethodVisibility::Public;
+                    bridge_body
+                }))
+                .collect();
+            lc.methods.extend(bridges);
+        }
         // Helper and view module functions have no controller context —
         // a bare `request` read there resolves to the per-dispatch
         // `ActionController::Current.request` (controllers keep their
@@ -2265,6 +2305,7 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
             rewrite_helper_calls(
                 &mut m.body,
                 &app.helper_method_index,
+                &helper_bridges,
                 &route_helpers,
                 &url_helper_classes,
                 rewrite_request,
@@ -3080,6 +3121,7 @@ fn view_helpers_path() -> Vec<Symbol> {
 fn rewrite_helper_calls(
     expr: &mut Expr,
     index: &HashMap<Symbol, ClassId>,
+    helper_bridges: &HashMap<Symbol, Symbol>,
     route_helpers: &std::collections::HashSet<Symbol>,
     url_helper_classes: &std::collections::HashSet<Symbol>,
     rewrite_request: bool,
@@ -3091,6 +3133,7 @@ fn rewrite_helper_calls(
         rewrite_helper_calls(
             c,
             index,
+            helper_bridges,
             route_helpers,
             url_helper_classes,
             rewrite_request,
@@ -3492,7 +3535,7 @@ fn rewrite_helper_calls(
         }
         *expr.node = ExprNode::Send {
             recv: Some(Expr::new(span, ExprNode::Const { path })),
-            method,
+            method: helper_bridges.get(&method).cloned().unwrap_or(method),
             args,
             block,
             parenthesized: true,
