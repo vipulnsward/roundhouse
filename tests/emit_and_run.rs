@@ -8,6 +8,48 @@
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
+#[test]
+fn templates_can_call_private_helpers_without_exposing_them() {
+    emit_and_run::real_blog()
+        .write(
+            "app/helpers/articles_helper.rb",
+            r#"module ArticlesHelper
+  def __rh_view_private_label_0; "collision"; end
+  private
+  def private_label(article, suffix: "!")
+    article.title + suffix
+  end
+  protected
+  def guarded_label(article); private_label(article); end
+  class << self
+    private
+    def secret_class_label; "secret"; end
+  end
+end
+"#,
+        )
+        .write(
+            "app/views/articles/_helper_probe.html.erb",
+            "<%= private_label(article, suffix: \"?\") %><%= guarded_label(article) %>",
+        )
+        .run_ruby(r#"
+article = Article.new(title: "seed", body: "body")
+html = Views::Articles.helper_probe(article)
+raise "private helper failed to render" unless html == "seed?seed!"
+raise "bridge collision" unless ArticlesHelper.__rh_view_private_label_0 == "collision"
+[:private_label, :guarded_label, :secret_class_label].each do |name|
+  raise "helper exposed publicly" if ArticlesHelper.respond_to?(name)
+  begin
+    name == :secret_class_label ? ArticlesHelper.public_send(name) : ArticlesHelper.public_send(name, article)
+    raise "public_send exposed helper"
+  rescue NoMethodError
+  end
+end
+puts "private view helper checks passed"
+"#)
+        .assert_passes();
+}
+
 /// The harness itself: the unedited blog emits and its controller
 /// suite, which renders every page, passes.
 #[test]

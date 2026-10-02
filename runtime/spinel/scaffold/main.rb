@@ -289,18 +289,22 @@ module Main
       Main.dispatch_request(req, res)
     rescue StandardError, ScriptError
       res.status = 500
+      Main.log_request_metrics(req, 500, "internal server error".bytesize, started)
       raise
-    ensure
-      duration = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000.0
-      bytes = res.body.bytesize
-      bytes = Sock.sphttp_filesize(res.file_path) if res.file_path.length > 0
-      status = res.upgrading_ws ? 101 : res.status
-      $stdout.write "{\"rh_request\":{\"method\":" + JSON.generate(req.verb) +
-        ",\"path\":" + JSON.generate(Main.metric_path(req.path)) +
-        ",\"status\":" + status.to_s + ",\"duration_ms\":" + duration.to_s +
-        ",\"bytes\":" + bytes.to_s + "}}\n"
-      $stdout.flush
     end
+    bytes = res.body.bytesize
+    bytes = Sock.sphttp_filesize(res.file_path) if res.file_path.length > 0
+    status = res.upgrading_ws ? 101 : res.status
+    Main.log_request_metrics(req, status, bytes, started)
+  end
+
+  def self.log_request_metrics(req, status, bytes, started)
+    duration = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000.0
+    $stdout.write "{\"rh_request\":{\"method\":" + JSON.generate(req.verb) +
+      ",\"path\":" + JSON.generate(Main.metric_path(req.path)) +
+      ",\"status\":" + status.to_s + ",\"duration_ms\":" + duration.to_s +
+      ",\"bytes\":" + bytes.to_s + "}}\n"
+    $stdout.flush
   end
 
   # Only fixed route words survive. Invite codes, auto-login tokens, bot keys,
