@@ -224,6 +224,7 @@ pub struct ViewLowerCtx<'a> {
     nilable_scalar_reads: std::rc::Rc<std::collections::HashSet<String>>,
     html_safe_methods: std::rc::Rc<std::collections::HashSet<String>>,
     model_singulars: std::rc::Rc<std::collections::HashSet<String>>,
+    sti_subclasses: std::rc::Rc<std::collections::HashMap<String, Vec<String>>>,
     slug_models: std::rc::Rc<std::collections::HashSet<String>>,
     bool_readers: std::rc::Rc<std::collections::HashMap<String, std::collections::HashSet<String>>>,
     store_readers:
@@ -305,6 +306,21 @@ impl<'a> ViewLowerCtx<'a> {
                         ))
                     })
                     .map(|m| crate::naming::snake_case(m.name.0.as_str()))
+                    .collect(),
+            ),
+            sti_subclasses: std::rc::Rc::new(
+                app.models
+                    .iter()
+                    .filter(|m| !m.sti_subclass_names.is_empty())
+                    .map(|m| {
+                        (
+                            crate::naming::snake_case(m.name.0.as_str()),
+                            m.sti_subclass_names
+                                .iter()
+                                .map(|s| s.0.as_str().to_string())
+                                .collect(),
+                        )
+                    })
                     .collect(),
             ),
             bool_readers: std::rc::Rc::new(bool_reader_names(app)),
@@ -697,6 +713,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
         nilable_scalar_reads: lx.nilable_scalar_reads.clone(),
         html_safe_methods: lx.html_safe_methods.clone(),
         model_singulars: lx.model_singulars.clone(),
+        sti_subclasses: lx.sti_subclasses.clone(),
         slug_models: lx.slug_models.clone(),
         bool_readers: lx.bool_readers.clone(),
         store_readers: lx.store_readers.clone(),
@@ -3885,6 +3902,9 @@ pub(super) struct ViewCtx {
     /// runtime `url_for`, whose `is_a?`-dispatch shape is
     /// CRuby-overlay-only.
     pub(super) model_singulars: std::rc::Rc<std::collections::HashSet<String>>,
+    /// Known STI subclasses of each base model; shared forms resolve the
+    /// record's subtype at runtime rather than posting to the base route.
+    pub(super) sti_subclasses: std::rc::Rc<std::collections::HashMap<String, Vec<String>>>,
     /// Snake-singular names of models that OVERRIDE `to_param`
     /// (lobsters' Story→short_id, Domain→domain). The form-action
     /// member arm passes `record.to_param` for these — Rails fills
