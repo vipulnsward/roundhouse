@@ -114,6 +114,35 @@ class ActionControllerCookiesTest < Minitest::Test
     assert_equal "tok", jar.signed[:session_token]
   end
 
+  def test_signed_preserves_cookie_security_attributes_and_browser_expiry
+    expires = Time.now + 60
+    @jar.signed[:google_login_state] = { value: "nonce", httponly: true, secure: true, same_site: :lax, path: "/session", expires: expires }
+    assert_equal "nonce", @jar.signed[:google_login_state]
+    assert_equal({"Path" => "/session", "HttpOnly" => "", "Secure" => "", "SameSite" => "Lax", "Expires" => expires.utc.strftime("%a, %d %b %Y %H:%M:%S GMT")}, @jar.options_for(:google_login_state))
+  end
+
+  def test_signed_expiry_is_verified_even_when_browser_replays_the_cookie
+    @jar.signed[:google_login_state] = { value: "nonce", expires: Time.now - 1 }
+    replayed = ActionController::CookieJar.new({"google_login_state" => @jar[:google_login_state]})
+    assert_nil replayed.signed[:google_login_state]
+  end
+
+  def test_deletion_expires_the_browser_cookie_at_its_path
+    @jar.signed[:google_login_state] = { value: "nonce", path: "/session", httponly: true, secure: true }
+    @jar.delete(:google_login_state)
+    assert_equal "", @jar.pending["google_login_state"]
+    assert_nil @jar.signed[:google_login_state]
+    assert_equal({"Path" => "/session", "HttpOnly" => "", "Secure" => "", "Max-Age" => "0", "Expires" => "Thu, 01 Jan 1970 00:00:00 GMT"}, @jar.options_for(:google_login_state))
+  end
+
+  def test_plain_cookie_options_keep_only_the_value_in_the_value_store
+    @jar[:plain] = { value: "test", httponly: true, same_site: :strict }
+    assert_equal "test", @jar[:plain]
+    assert_equal({"Path" => "/", "HttpOnly" => "", "SameSite" => "Strict"}, @jar.options_for(:plain))
+    @jar.delete(:plain, path: "/custom")
+    assert_equal "/custom", @jar.options_for(:plain)["Path"]
+  end
+
   # NIL, as Rails answers — the signed read is the one nullable read in
   # this jar. `if token = cookies.signed[:session_token]` is campfire's
   # `SessionLookup`, and an empty String is TRUTHY in Ruby, so a `""`

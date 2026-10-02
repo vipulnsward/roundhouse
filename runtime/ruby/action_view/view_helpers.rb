@@ -508,6 +508,25 @@ module ActionView
       inner_opts = opts.to_h.dup
       inner_opts.delete(:method)
       inner_opts.delete(:form_class)
+      inner_opts.delete(:form)
+      inner_opts.delete(:params)
+      form_options = opts.fetch(:form, nil)
+      form_options_html = ""
+      if form_options.is_a?(Hash)
+        form_class = form_options.fetch(:class, form_class)
+        extra_form_opts = form_options.to_h.dup
+        extra_form_opts.delete(:class)
+        extra_form_opts.delete(:action)
+        extra_form_opts.delete(:method)
+        form_options_html = render_attrs(extra_form_opts)
+      end
+      params_inputs = +""
+      parameters = opts.fetch(:params, nil)
+      if parameters.is_a?(Hash)
+        parameters.each do |name, value|
+          params_inputs = params_inputs + "<input" + render_attrs({ type: "hidden", name: name.to_s, value: value.to_s, autocomplete: "off" }) + ">"
+        end
+      end
       # `.to_h` makes form_attrs a Hash (Ruby no-op; Crystal converts
        # the NamedTuple literal). Subsequent `[:class] = ...` mutation
       # would fail on Crystal's immutable NamedTuple.
@@ -532,7 +551,7 @@ module ActionView
       # Through the one choke point, so the broadcast-render omission
       # above covers button_to forms too.
       auth_token_input = csrf_token_hidden_input
-      %(<form#{render_attrs(form_attrs)}>#{method_input}<button#{button_attrs}>#{html_escape(text)}</button>#{auth_token_input}</form>)
+      %(<form#{render_attrs(form_attrs)}#{form_options_html}>#{method_input}<button#{button_attrs}>#{html_escape(text)}</button>#{auth_token_input}#{params_inputs}</form>)
     end
   
     # ── Asset / meta tag helpers (stubs for now) ─────────────────────

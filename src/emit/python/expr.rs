@@ -497,7 +497,14 @@ pub(super) fn emit_stmt(e: &Expr, is_last: bool, void_return: bool) -> String {
             if is_nil_or_empty(else_branch) && (!is_last || void_return) =>
         {
             match &*then_branch.node {
-                ExprNode::Seq { .. } => {
+                // A compound statement cannot follow an inline `if:`
+                // suite, including an `each` send emitted as a for loop.
+                ExprNode::Seq { .. }
+                | ExprNode::If { .. }
+                | ExprNode::While { .. }
+                | ExprNode::Case { .. }
+                | ExprNode::BeginRescue { .. }
+                | ExprNode::Send { block: Some(_), .. } => {
                     format!("if {}:\n{}", emit_expr(cond), emit_block_body(then_branch, void_return))
                 }
                 _ => format!("if {}: {}", emit_expr(cond), emit_stmt(then_branch, false, true)),

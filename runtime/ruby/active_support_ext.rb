@@ -34,6 +34,11 @@
 # Integer's `"0"` is not blank, a Symbol's `"sym"` is not blank, and a
 # String is itself.
 module ActiveSupport
+  module SecurityUtils
+    def self.secure_compare(a, b)
+      ActionController::MessageVerifier.secure_compare(a, b)
+    end
+  end
   def self.blank?(value)
     return true if value.nil?
     return true if value == false

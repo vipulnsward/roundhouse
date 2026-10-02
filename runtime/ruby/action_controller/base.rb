@@ -216,7 +216,10 @@ module ActionController
     # status; surfaces flash messages via the flash hash. Default
     # status 302 (Found). Real-blog uses 303 (See Other) on
     # PATCH/DELETE responses; pass `status: :see_other` to match.
-    def redirect_to(path, notice: nil, alert: nil, status: :found)
+    # Existing callers validate destinations themselves. This shared base
+    # has no request host context; requested host protection fails closed.
+    def redirect_to(path, notice: nil, alert: nil, status: :found, allow_other_host: true)
+      raise NotImplementedError, "redirect host protection is not supported" unless allow_other_host
       @location = path
       @status   = resolve_status(status)
       @performed = true

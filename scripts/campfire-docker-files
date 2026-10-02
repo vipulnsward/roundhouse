@@ -35,7 +35,7 @@ cat > "$DIR/Dockerfile" <<'DOCKERFILE'
 
 FROM debian:trixie-slim AS build
 RUN apt-get update -qq && \
-    apt-get install --no-install-recommends -y clang make libsqlite3-dev libjemalloc-dev libvips-dev && \
+    apt-get install --no-install-recommends -y clang make libsqlite3-dev libjemalloc-dev libvips-dev libssl-dev && \
     rm -rf /var/lib/apt/lists/*
 COPY pack /src
 RUN make -C /src -j"$(nproc)" CC=clang
@@ -45,7 +45,7 @@ FROM debian:trixie-slim
 # link unfurls, webhooks and Web Push all leave over https, and
 # debian:trixie-slim has no store at all.
 RUN apt-get update -qq && \
-    apt-get install --no-install-recommends -y ca-certificates libsqlite3-0 libjemalloc2 libvips42 ffmpeg && \
+    apt-get install --no-install-recommends -y ca-certificates libsqlite3-0 libjemalloc2 libvips42 ffmpeg libssl3t64 && \
     rm -rf /var/lib/apt/lists/*
 # The server runs as an unprivileged user, as campfire's own image does
 # (uid 1000, named for that image's `rails`).
@@ -115,7 +115,7 @@ the runtime it was generated against travels with it.
 Compiles the C — one whole-program translation unit, a minute or two on a
 fast machine, longer on a slow one — and produces a ~600 MB image:
 \`debian:trixie-slim\` plus the CA certificates and the SQLite, jemalloc
-and libvips runtime libraries and ffmpeg. libvips resizes the uploads —
+libvips and OpenSSL runtime libraries and ffmpeg. libvips resizes the uploads —
 attachments, avatars, the account logo — into the variants Rails serves;
 ffmpeg makes the video previews. Those two are most of the size: the
 binary is about 11 MB.
@@ -172,7 +172,7 @@ the app builds its absolute URLs with the scheme the proxy reports in
 ## Without Docker
 
 The Dockerfile is a recipe, not a requirement. On Linux with a C
-compiler, \`make\`, \`libsqlite3-dev\`, \`libjemalloc-dev\` and \`libvips-dev\`
+compiler, \`make\`, \`libsqlite3-dev\`, \`libjemalloc-dev\`, \`libvips-dev\` and \`libssl-dev\`
 (and \`ffmpeg\` on the path for video previews):
 
 \`\`\`sh

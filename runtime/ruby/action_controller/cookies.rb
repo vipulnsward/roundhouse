@@ -19,6 +19,7 @@ module ActionController
     def initialize(inbound = {})
       @inbound = {}
       @out = {}
+      @options = {}
       # Copy via `.each` (pair iteration), not `.keys`: the inbound hash is
       # the request's `Tep.str_hash` (a `Hash.new("")`), whose `.keys`
       # intrinsic yields a null array through the loosely-typed `req.cookies`
@@ -37,7 +38,8 @@ module ActionController
     end
 
     def []=(key, value)
-      raw_set(key, value)
+      record_options(key, value)
+      raw_set(key, ActionController::SignedCookieJar.value_of(value))
     end
 
     # `cookies.permanent[:k] = v` — expiry is not modeled; permanence is a
@@ -92,12 +94,38 @@ module ActionController
       @out[key.to_s]
     end
 
-    # Removing a cookie is recorded as an empty write; the dispatcher emits a
-    # cleared Set-Cookie. (No separate tombstone type keeps @out a plain
-    # String→String map for the strict typer.)
-    def delete(key)
+    # Keep the value store String-valued; transport attributes have their
+    # own typed map. A deletion expires the browser cookie as well.
+    def delete(key, options = {})
+      record_options(key, options) if options.is_a?(Hash) && !options.empty?
+      attributes = options_for(key).dup
+      attributes["Max-Age"] = "0"
+      attributes["Expires"] = "Thu, 01 Jan 1970 00:00:00 GMT"
+      @options[key.to_s] = attributes
       @out[key.to_s] = ""
       ""
+    end
+
+    def record_options(key, value)
+      attributes = { "Path" => "/" }
+      if value.is_a?(Hash)
+        attributes["Path"] = value[:path].to_s unless value[:path].nil?
+        attributes["HttpOnly"] = "" if value[:httponly] == true
+        attributes["Secure"] = "" if value[:secure] == true
+        same_site = value[:same_site].to_s.downcase
+        attributes["SameSite"] = same_site.capitalize if ["lax", "strict", "none"].include?(same_site)
+        expires = value[:expires]
+        if expires.is_a?(Time)
+          attributes["Expires"] = expires.utc.strftime("%a, %d %b %Y %H:%M:%S GMT")
+        end
+      end
+      @options[key.to_s] = attributes
+      attributes
+    end
+
+    def options_for(key)
+      return @options[key.to_s] if @options.key?(key.to_s)
+      { "Path" => "/" }
     end
 
     # Pending writes, for the dispatcher's Set-Cookie serialization. NOT
@@ -190,17 +218,15 @@ module ActionController
       verified == "" ? nil : verified
     end
 
-    # Rails takes either a bare value or an options Hash carrying
-    # `value:` beside `httponly:`/`same_site:` — campfire writes the
-    # latter. The transport attributes are not modeled (the dispatcher
-    # emits Path=/ + HttpOnly for every cookie it writes), so what
-    # survives is the value.
+    # Options preserve browser attributes and bind expiry into the signed
+    # envelope, so replaying an expired cookie cannot bypass its lifetime.
     def []=(key, value)
-      signed = ActionController::MessageVerifier.generate(
+      @jar.record_options(key, value)
+      signed = ActionController::MessageVerifier.envelope(
         Rails.application.secret_key_base,
         ActionController::MessageVerifier::SIGNED_COOKIE_SALT,
-        ActionController::SignedCookieJar.value_of(value),
-        "cookie." + key.to_s, true
+        ActionController::MessageVerifier.json_string(ActionController::SignedCookieJar.value_of(value)),
+        "cookie." + key.to_s, ActionController::SignedCookieJar.expiry_of(value), true
       )
       @jar.raw_set(key, signed)
       value
@@ -213,8 +239,18 @@ module ActionController
       self
     end
 
-    def delete(key)
-      @jar.delete(key)
+    def delete(key, options = {})
+      @jar.delete(key, options)
+    end
+
+    def self.expiry_of(value)
+      if value.is_a?(Hash)
+        expires = value[:expires]
+        if expires.is_a?(Time)
+          return ActionController::MessageVerifier.json_string(ActionController::MessageVerifier.iso8601_ms(expires))
+        end
+      end
+      "null"
     end
 
     # The value out of either write form. Kept a class method with an
