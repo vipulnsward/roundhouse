@@ -537,8 +537,8 @@ pub(crate) fn link_to_wrapper_markup(
 /// Inline-expand `button_to text, url, opts` into the wrapping
 /// `<form action="..." method="post" class="<form_class>">...</form>`
 /// + method override hidden input + `<button>` + CSRF token hidden
-/// input shape Rails' runtime button_to produces. `method:` and
-/// `form_class:` are peeled off `opts` at lower time; the rest
+/// input shape Rails' runtime button_to produces. Form options and
+/// hidden params are peeled off `opts`; the remaining options
 /// flow as `<button>` element attributes. CSRF + _method override
 /// go through the same runtime primitives form_with uses.
 fn emit_button_to_inline(
@@ -627,8 +627,15 @@ pub(crate) fn button_to_wrapper_markup(
     mut opts_entries: Vec<(Expr, Expr)>,
 ) -> (Vec<InterpPart>, Vec<InterpPart>) {
     let method_expr = take_opt(&mut opts_entries, "method").unwrap_or_else(default_method_sym);
-    let form_class_expr =
-        take_opt(&mut opts_entries, "form_class").unwrap_or_else(default_form_class);
+    let mut form_opts = hash_entries(take_opt(&mut opts_entries, "form").as_ref());
+    // ponytail: literal scalar params; add recursive form-param lowering when nesting is needed.
+    let params = hash_entries(take_opt(&mut opts_entries, "params").as_ref());
+    let outer_class = take_opt(&mut opts_entries, "form_class");
+    let form_class_expr = take_opt(&mut form_opts, "class")
+        .or(outer_class)
+        .unwrap_or_else(default_form_class);
+    take_opt(&mut form_opts, "action");
+    take_opt(&mut form_opts, "method");
     // Remaining entries become `<button>` attributes.
     let button_opts = opts_entries;
 
@@ -644,10 +651,14 @@ pub(crate) fn button_to_wrapper_markup(
         value: "\" method=\"post\" class=\"".to_string(),
     });
     parts.push(InterpPart::Expr {
-        expr: view_helpers_call("html_escape", vec![form_class_expr]),
+        expr: view_helpers_call("html_escape", vec![lit_str_coerce(form_class_expr)]),
     });
     parts.push(InterpPart::Text {
-        value: "\">".to_string(),
+        value: "\"".to_string(),
+    });
+    append_attr_parts(&mut parts, &form_opts);
+    parts.push(InterpPart::Text {
+        value: ">".to_string(),
     });
     // _method hidden input (empty string when method is :get/:post).
     parts.push(InterpPart::Expr {
@@ -661,12 +672,38 @@ pub(crate) fn button_to_wrapper_markup(
     parts.push(InterpPart::Text {
         value: ">".to_string(),
     });
-    let suffix = vec![
-        InterpPart::Text { value: "</button>".to_string() },
+    let mut suffix = vec![
+        InterpPart::Text {
+            value: "</button>".to_string(),
+        },
         // CSRF authenticity_token hidden input.
-        InterpPart::Expr { expr: view_helpers_call("csrf_token_hidden_input", Vec::new()) },
-        InterpPart::Text { value: "</form>".to_string() },
+        InterpPart::Expr {
+            expr: view_helpers_call("csrf_token_hidden_input", Vec::new()),
+        },
     ];
+    for (name, value) in params {
+        suffix.push(InterpPart::Text {
+            value: "<input".to_string(),
+        });
+        append_attr_parts(
+            &mut suffix,
+            &[
+                (lit_sym(Symbol::from("type")), lit_str("hidden".to_string())),
+                (lit_sym(Symbol::from("name")), lit_str_coerce(name)),
+                (lit_sym(Symbol::from("value")), lit_str_coerce(value)),
+                (
+                    lit_sym(Symbol::from("autocomplete")),
+                    lit_str("off".to_string()),
+                ),
+            ],
+        );
+        suffix.push(InterpPart::Text {
+            value: ">".to_string(),
+        });
+    }
+    suffix.push(InterpPart::Text {
+        value: "</form>".to_string(),
+    });
     (parts, suffix)
 }
 

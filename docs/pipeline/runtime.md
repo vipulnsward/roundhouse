@@ -314,6 +314,15 @@ is falsy. No corpus call site reads the unsigned jar for presence — every
 one coerces with `.to_s` — which is why the signed read was closed and
 this one was not.
 
+### Redirect host protection is not modeled
+
+`redirect_to` preserves its existing caller-validated destination behavior
+and accepts `allow_other_host: true`. The shared base has no request host
+context; `allow_other_host: false` raises `NotImplementedError` before
+setting a response, rather than silently claiming host validation.
+Callers permitting external redirects must pin or validate the destination;
+Campfire's Google login pins its production DQOR issuer URL.
+
 ### An enum attribute reader yields the STORED value
 
 `user.status` answers `0` where Rails answers `"active"`. The generated

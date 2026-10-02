@@ -282,6 +282,55 @@ module Main
   end
 
   def self.dispatch(req, res)
+    return Main.dispatch_request(req, res) unless ENV["RH_REQUEST_METRICS"] == "1"
+
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    begin
+      Main.dispatch_request(req, res)
+    rescue StandardError, ScriptError
+      res.status = 500
+      raise
+    ensure
+      duration = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000.0
+      bytes = res.body.bytesize
+      bytes = Sock.sphttp_filesize(res.file_path) if res.file_path.length > 0
+      status = res.upgrading_ws ? 101 : res.status
+      $stdout.write "{\"rh_request\":{\"method\":" + JSON.generate(req.verb) +
+        ",\"path\":" + JSON.generate(Main.metric_path(req.path)) +
+        ",\"status\":" + status.to_s + ",\"duration_ms\":" + duration.to_s +
+        ",\"bytes\":" + bytes.to_s + "}}\n"
+      $stdout.flush
+    end
+  end
+
+  # Only fixed route words survive. Invite codes, auto-login tokens, bot keys,
+  # filenames and arbitrary 404 paths cannot reach the request log.
+  def self.metric_path(path)
+    path = path.split("?")[0].to_s
+    return "/assets/*" if path.start_with?("/assets/")
+    words = ["up", "cable", "join", "session", "new", "google", "callback", "transfers",
+      "account", "edit", "users", "me", "avatar", "profile", "sidebar", "ban", "bots",
+      "key", "join_code", "logo", "custom_styles", "rooms", "opens", "closeds", "directs",
+      "messages", "boosts", "refresh", "settings", "involvement", "searches", "clear",
+      "unfurl_link", "runtime", "stats", "webmanifest", "service-worker", "qr_code"]
+    segments = path.split("/")
+    safe = +""
+    segments.each do |segment|
+      unless segment.empty?
+        safe << "/"
+        if words.include?(segment)
+          safe << segment
+        elsif segment.match?(/\A[0-9]+\z/)
+          safe << ":id"
+        else
+          safe << ":redacted"
+        end
+      end
+    end
+    safe.empty? ? "/" : safe
+  end
+
+  def self.dispatch_request(req, res)
     ActionView::ViewHelpers.reset_slots!
     Broadcasts.reset_log!
     # Under RH_SQL_TRACE the request line brackets its queries, so a
@@ -568,8 +617,8 @@ module Main
     while ci < ock.length
       cname = ock[ci]
       copts = Tep.str_hash
-      copts["Path"] = "/"
-      res.set_cookie(cname, out_cookies[cname], copts)
+      controller.cookies.options_for(cname).each { |key, value| copts[key.to_s] = value.to_s }
+      res.set_cookie(cname.to_s, out_cookies[cname].to_s, copts)
       ci += 1
     end
 

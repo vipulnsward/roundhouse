@@ -52,3 +52,37 @@ def pluralize(count: int, word: str) -> str:
 ";
     assert_eq!(emitted.trim(), handwritten.trim());
 }
+
+#[test]
+fn conditional_each_emits_an_indented_python_loop() {
+    let methods = parse_methods_with_rbs(
+        r#"
+module Helpers
+  def join_parameters(parameters)
+    output = +""
+    if parameters.is_a?(Hash)
+      parameters.each do |name, value|
+        output = output + name + "=" + value + ";"
+      end
+    end
+    output
+  end
+end
+"#,
+        "module Helpers\n  def join_parameters: (Hash[String, String] | nil) -> String\nend\n",
+    )
+    .expect("parse");
+    let emitted = emit_method(&methods[0]);
+    let script = format!(
+        "{emitted}\nassert join_parameters({{\"join_code\": \"invite\"}}) == \"join_code=invite;\"\nassert join_parameters(None) == \"\"\n"
+    );
+    let result = std::process::Command::new("python3")
+        .args(["-c", &script])
+        .output()
+        .expect("run emitted Python");
+    assert!(
+        result.status.success(),
+        "{}\nemitted Python:\n{emitted}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}

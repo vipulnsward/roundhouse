@@ -80,7 +80,8 @@ module ActionController
       String path,
       ?notice: String?,
       ?alert: String?,
-      ?status: Symbol
+      ?status: Symbol,
+      ?allow_other_host: bool
     ) -> void
 
     # `head(:no_content, content_type: "application/json")` — empty

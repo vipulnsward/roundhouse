@@ -1,4 +1,7 @@
 module ActiveSupport
+  module SecurityUtils
+    def self.secure_compare: (String a, String b) -> bool
+  end
   def self.blank?: (untyped value) -> bool
 
   def self.present?: (untyped value) -> bool

@@ -84,6 +84,19 @@ class ActionControllerBaseTest < Minitest::Test
     assert_equal "/somewhere", @controller.location
   end
 
+  def test_redirect_to_explicitly_allows_the_trusted_google_issuer
+    @controller.redirect_to("https://deccanqueenonrails.com/chat/login?state=nonce", allow_other_host: true, status: :see_other)
+    assert_equal 303, @controller.status
+    assert_equal "https://deccanqueenonrails.com/chat/login?state=nonce", @controller.location
+  end
+
+  def test_redirect_to_rejects_unsupported_host_protection_before_responding
+    assert_raises(NotImplementedError) { @controller.redirect_to("https://attacker.example", allow_other_host: false) }
+    assert_nil @controller.location
+    refute @controller.performed?
+    assert_equal 200, @controller.status
+  end
+
   def test_redirect_to_propagates_notice_to_flash
     @controller.redirect_to("/x", notice: "Saved")
     assert_equal "Saved", @controller.flash.fetch(:notice)
