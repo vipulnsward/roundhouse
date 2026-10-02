@@ -686,7 +686,7 @@ fn route_helperize(url: Expr, route_helpers: &impl Fn() -> Expr, ctx: &ViewCtx) 
                 || ctx.route_helper_names.contains(&format!("{name}_path"));
             let has_collection = ctx.route_helper_names.is_empty()
                 || ctx.route_helper_names.contains(&format!("{plural}_path"));
-            return match (has_member, has_collection) {
+            let action = match (has_member, has_collection) {
                 (true, false) => member,
                 (false, true) => collection,
                 _ => Expr::new(
@@ -698,6 +698,7 @@ fn route_helperize(url: Expr, route_helpers: &impl Fn() -> Expr, ctx: &ViewCtx) 
                     },
                 ),
             };
+            return sti_record_action(&url, name, action, ctx);
         }
     }
     // Any other bare local/ivar defers to the runtime's url_for
@@ -1023,14 +1024,82 @@ fn classify_form_with_components(
         )
     });
 
+    let model_name = record_model_name(&model, ctx, &singular);
+    let action = sti_record_action(&model, &model_name, action, ctx);
     Some(FormWithComponents {
-        model_name: record_model_name(&model, ctx, &singular),
+        model_name,
         model,
         action,
         method,
         opts_entries,
         id_prefix: namespace.unwrap_or_default(),
     })
+}
+
+/// A shared form can hold any STI subtype, even when its static type is
+/// the base. `dom_prefix` already resolves that subtype from the stored
+/// discriminator, including records hydrated as the base class.
+fn sti_record_action(record: &Expr, model_name: &str, fallback: Expr, ctx: &ViewCtx) -> Expr {
+    let Some(subclasses) = ctx.sti_subclasses.get(model_name) else {
+        return fallback;
+    };
+    let mut arms = Vec::new();
+    for class in subclasses {
+        let singular = crate::naming::underscore(class).replace('/', "_");
+        let plural = crate::naming::pluralize_snake(&singular);
+        let member = format!("{singular}_path");
+        let collection = format!("{plural}_path");
+        let has_member = ctx.route_helper_names.contains(&member);
+        let has_collection = ctx.route_helper_names.contains(&collection);
+        if !has_member && !has_collection {
+            continue;
+        }
+        let segment = if ctx.slug_models.contains(&crate::naming::snake_case(class)) {
+            "to_param"
+        } else {
+            "id"
+        };
+        let member_path = super::member_path_call(
+            ctx,
+            &member,
+            send(Some(record.clone()), segment, Vec::new(), None, false),
+        );
+        let collection_path = super::route_helpers_call(&collection, Vec::new());
+        let body = match (has_member, has_collection) {
+            (true, false) => member_path,
+            (false, true) => collection_path,
+            _ => Expr::new(
+                Span::synthetic(),
+                ExprNode::If {
+                    cond: send(Some(record.clone()), "persisted?", Vec::new(), None, false),
+                    then_branch: member_path,
+                    else_branch: collection_path,
+                },
+            ),
+        };
+        arms.push(crate::expr::Arm {
+            pattern: crate::expr::Pattern::Lit {
+                value: Literal::Str { value: singular },
+            },
+            guard: None,
+            body,
+        });
+    }
+    if arms.is_empty() {
+        return fallback;
+    }
+    arms.push(crate::expr::Arm {
+        pattern: crate::expr::Pattern::Wildcard,
+        guard: None,
+        body: fallback,
+    });
+    Expr::new(
+        Span::synthetic(),
+        ExprNode::Case {
+            scrutinee: send(Some(record.clone()), "dom_prefix", Vec::new(), None, false),
+            arms,
+        },
+    )
 }
 
 /// The form's object name — what Rails calls `param_key`. Rails names
@@ -1497,6 +1566,7 @@ mod tests {
                 model_singulars.iter().map(|s| s.to_string()).collect::<HashSet<_>>(),
             ),
             slug_models: Default::default(),
+            sti_subclasses: Default::default(),
             bool_readers: Default::default(),
             store_readers: Default::default(),
             route_helper_names: Default::default(),

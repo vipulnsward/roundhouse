@@ -1545,6 +1545,7 @@ mod tests {
             nilable_scalar_reads: Default::default(),
             html_safe_methods: Default::default(),
             model_singulars: Default::default(),
+            sti_subclasses: Default::default(),
             slug_models: Default::default(),
             bool_readers: Default::default(),
             store_readers: Default::default(),
