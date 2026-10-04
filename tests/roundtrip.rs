@@ -41,6 +41,7 @@ fn tiny_blog_round_trips() {
             ],
             indexes: vec![],
             foreign_keys: vec![],
+            constraints: Default::default(),
             virtual_module: None,
         },
     );

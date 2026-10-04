@@ -218,7 +218,7 @@ fn synth_adapter_insert(owner: &ClassId, table: &Table, schema: &Schema) -> Meth
     let assignments: Vec<Assignment> = table
         .columns
         .iter()
-        .filter(|c| !c.primary_key || supplied_key.is_some())
+        .filter(|c| (!c.primary_key || supplied_key.is_some()) && !table.constraints.generated_columns.contains_key(&c.name))
         .map(|c| Assignment {
             column: c.name.clone(),
             value: Value::Runtime {
@@ -312,7 +312,7 @@ fn synth_adapter_update(owner: &ClassId, table: &Table, schema: &Schema) -> Meth
     let assignments: Vec<Assignment> = table
         .columns
         .iter()
-        .filter(|c| !c.primary_key)
+        .filter(|c| !c.primary_key && !table.constraints.generated_columns.contains_key(&c.name))
         .map(|c| Assignment {
             column: c.name.clone(),
             value: Value::Runtime {

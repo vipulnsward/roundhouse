@@ -933,6 +933,14 @@ pub fn target_files(
     fixture: &Path,
     target: BuildTarget,
 ) -> Result<Vec<(String, String)>, String> {
+    if !matches!(target, BuildTarget::Blog | BuildTarget::Spinel | BuildTarget::Ruby)
+        && app.schema.tables.values().any(|table| !table.constraints.generated_columns.is_empty() || !table.constraints.composite_foreign_keys.is_empty() || !table.constraints.checks.is_empty())
+    {
+        return Err("generated, composite foreign key and check constraints require the verified Ruby or Spinel target".into());
+    }
+    if !matches!(target, BuildTarget::Blog) {
+        crate::emit::shared::schema_sql::render_schema_statements_for(&app.schema, crate::emit::shared::schema_sql::Dialect::Sqlite)?;
+    }
     reject_unsupported_dates(app, target)?;
     reject_unsupported_forwarded_procs(app, target)?;
     report_unsupported_keys(app, target);
@@ -3443,6 +3451,7 @@ fn scaffold_readme_to_specimen(files: &mut [(String, String)]) {
 /// `spinel: main.rb: cannot load such file` rather than as anything a
 /// unit test could see. A toolchain test should drive what ships.
 pub fn spinel_base_files(app: &App, fixture: &Path) -> Result<Vec<(String, String)>, String> {
+    crate::emit::shared::schema_sql::render_schema_statements_for(&app.schema, crate::emit::shared::schema_sql::Dialect::Sqlite)?;
     // The bundled-library requires belong HERE, not only in
     // `spin_shape`. This is the tree `tests/spinel_toolchain.rs`
     // compiles, and without them it compiles something the CLI never

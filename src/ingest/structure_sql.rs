@@ -262,6 +262,7 @@ fn handle_create_table(
             columns,
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            constraints: Default::default(),
             virtual_module: None,
         },
     );

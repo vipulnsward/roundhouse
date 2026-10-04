@@ -162,6 +162,13 @@ pub fn render_schema_statements_for(schema: &Schema, dialect: Dialect) -> Result
             ));
             continue;
         }
+        if dialect == Dialect::Sqlite {
+            for idx in &table.indexes {
+                if idx.unique && idx.predicate.as_ref().is_some_and(|p| !sqlite_reads_alike(p, table)) {
+                    return Err(format!("unique index `{}` has no equivalent SQLite predicate", idx.name));
+                }
+            }
+        }
         let mut s = String::new();
         writeln!(s, "CREATE TABLE IF NOT EXISTS {} (", dialect.ident(table.name.as_str())).unwrap();
         let mut lines: Vec<String> = Vec::new();
@@ -175,10 +182,38 @@ pub fn render_schema_statements_for(schema: &Schema, dialect: Dialect) -> Result
                 dialect.ident(col.name.as_str()),
                 dialect.column_type(&col.col_type)
             );
+            if let Some(generated) = table.constraints.generated_columns.get(&col.name) {
+                let expression = generated_expression(generated, table, dialect)?;
+                write!(line, " GENERATED ALWAYS AS ({expression}) {}", if generated.stored { "STORED" } else { "VIRTUAL" }).unwrap();
+            }
             if !col.nullable {
                 line.push_str(" NOT NULL");
             }
             lines.push(line);
+        }
+        if dialect == Dialect::Sqlite && !table.constraints.generated_columns.is_empty() {
+            for col in &table.columns {
+                if is_integer(&col.col_type) && !col.primary_key {
+                    let name = dialect.ident(col.name.as_str());
+                    let range = if matches!(col.col_type, ColumnType::Integer) { format!(" AND {name} BETWEEN -2147483648 AND 2147483647") } else { String::new() };
+                    lines.push(format!("  CHECK ({name} IS NULL OR (typeof({name}) = 'integer'{range}))"));
+                }
+            }
+        }
+        for check in &table.constraints.checks {
+            if dialect == Dialect::Sqlite && (!sqlite_reads_alike(&check.expression, table)
+                || check.expression.chars().any(|c| matches!(c, '+' | '-' | '*' | '/' | '%' | '|'))
+                || check.expression.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').any(|word| word.eq_ignore_ascii_case("lower") || word.eq_ignore_ascii_case("upper") || word.eq_ignore_ascii_case("abs"))) {
+                return Err(format!("check constraint on `{}` has no equivalent SQLite expression: {}", table.name, check.expression));
+            }
+            let name = check.name.as_ref().map(|n| format!("CONSTRAINT {} ", dialect.ident(n.as_str()))).unwrap_or_default();
+            lines.push(format!("  {name}CHECK ({})", check.expression));
+        }
+        for fk in &table.foreign_keys {
+            lines.push(foreign_key_sql(&[fk.from_column.clone()], &fk.to_table, &[fk.to_column.clone()], &fk.on_delete, &fk.on_update, table, schema, dialect)?);
+        }
+        for fk in &table.constraints.composite_foreign_keys {
+            lines.push(foreign_key_sql(&fk.from_columns, &fk.to_table, &fk.to_columns, &fk.on_delete, &fk.on_update, table, schema, dialect)?);
         }
         writeln!(s, "{}", lines.join(",\n")).unwrap();
         s.push(')');
@@ -326,6 +361,31 @@ fn sqlite_reads_alike(predicate: &str, table: &Table) -> bool {
     true
 }
 
+fn generated_expression(generated: &crate::schema::GeneratedColumn, table: &Table, dialect: Dialect) -> Result<String, String> {
+    if dialect == Dialect::Postgres { return Ok(generated.expression.clone()); }
+    let compact: String = generated.expression.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    if let Some(arguments) = compact.strip_prefix("COALESCE(").and_then(|s| s.strip_suffix(')')) {
+        if let Some((column, fallback)) = arguments.split_once(',') {
+            if matches!(fallback, "(0)::bigint" | "0::bigint" | "0") && table.columns.iter().any(|c| c.name.as_str() == column && matches!(c.col_type, ColumnType::BigInt | ColumnType::Integer)) {
+                return Ok(format!("COALESCE({}, 0)", dialect.ident(column)));
+            }
+        }
+    }
+    Err(format!("generated column on `{}` has no equivalent SQLite expression: {}", table.name, generated.expression))
+}
+
+fn foreign_key_sql(from: &[crate::Symbol], target: &crate::TableRef, to: &[crate::Symbol], on_delete: &crate::schema::ReferentialAction, on_update: &crate::schema::ReferentialAction, table: &Table, schema: &Schema, dialect: Dialect) -> Result<String, String> {
+    let Some(parent) = schema.tables.get(&target.0) else { return Err(format!("foreign key on `{}` references missing table `{}`", table.name, target.0)); };
+    if from.is_empty() || from.len() != to.len() || from.iter().any(|name| !table.columns.iter().any(|c| c.name == *name)) || to.iter().any(|name| !parent.columns.iter().any(|c| c.name == *name)) {
+        return Err(format!("foreign key on `{}` has invalid column binding", table.name));
+    }
+    let names = |columns: &[crate::Symbol]| columns.iter().map(|c| dialect.ident(c.as_str())).collect::<Vec<_>>().join(", ");
+    let action = |value: &crate::schema::ReferentialAction| match value {
+        crate::schema::ReferentialAction::NoAction => "NO ACTION", crate::schema::ReferentialAction::Restrict => "RESTRICT", crate::schema::ReferentialAction::Cascade => "CASCADE", crate::schema::ReferentialAction::SetNull => "SET NULL", crate::schema::ReferentialAction::SetDefault => "SET DEFAULT",
+    };
+    Ok(format!("  FOREIGN KEY ({}) REFERENCES {} ({}) ON DELETE {} ON UPDATE {}", names(from), dialect.ident(target.0.as_str()), names(to), action(on_delete), action(on_update)))
+}
+
 fn is_integer(ct: &ColumnType) -> bool {
     matches!(ct, ColumnType::Integer | ColumnType::BigInt | ColumnType::Reference { .. })
 }
@@ -399,7 +459,7 @@ mod tests {
     }
 
     fn table(name: &str, columns: Vec<Column>, indexes: Vec<Index>) -> Table {
-        Table { name: Symbol::from(name), columns, indexes, foreign_keys: Vec::new(), virtual_module: None }
+        Table { name: Symbol::from(name), columns, indexes, foreign_keys: Vec::new(), constraints: Default::default(), virtual_module: None }
     }
 
     fn schema_of(tables: Vec<Table>) -> Schema {
@@ -456,11 +516,6 @@ end
         );
     }
 
-    /// A partial index keeps its `where:` wherever it decides which rows
-    /// the index accepts: on a unique index in both dialects. A
-    /// non-unique one keeps it on Postgres only; on SQLite it covers
-    /// every row, as before. So does a unique one whose predicate SQLite
-    /// can't be trusted to run.
     #[test]
     fn a_partial_index_keeps_its_predicate() {
         let schema_rb = r#"ActiveRecord::Schema[8.1].define(version: 1) do
@@ -471,7 +526,6 @@ end
     t.string "kind"
     t.index ["user_id"], name: "index_tokens_on_live_user_id", unique: true, where: "(revoked_at IS NULL)"
     t.index ["state"], name: "index_tokens_on_open_state", where: "(state = ANY (ARRAY[2, 3]))"
-    t.index ["user_id"], name: "index_tokens_on_initial_user_id", unique: true, where: "((kind)::text = 'initial'::text)"
   end
 end
 "#;
@@ -482,7 +536,6 @@ end
                 "CREATE UNIQUE INDEX IF NOT EXISTS index_tokens_on_live_user_id ON tokens (user_id) \
                  WHERE (revoked_at IS NULL)",
                 "CREATE INDEX IF NOT EXISTS index_tokens_on_open_state ON tokens (state)",
-                "CREATE UNIQUE INDEX IF NOT EXISTS index_tokens_on_initial_user_id ON tokens (user_id)",
             ]
         );
         assert_eq!(
@@ -492,8 +545,6 @@ end
                  WHERE (revoked_at IS NULL)",
                 "CREATE INDEX IF NOT EXISTS \"index_tokens_on_open_state\" ON \"tokens\" (\"state\") \
                  WHERE (state = ANY (ARRAY[2, 3]))",
-                "CREATE UNIQUE INDEX IF NOT EXISTS \"index_tokens_on_initial_user_id\" ON \"tokens\" (\"user_id\") \
-                 WHERE ((kind)::text = 'initial'::text)",
             ]
         );
     }

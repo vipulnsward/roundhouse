@@ -716,24 +716,34 @@ class DbPool
     @lock  = Mutex.new
     @cv    = ConditionVariable.new
     i = 0
-    while i < n
-      rc = SQL.sqlite3_open_v2(path, SQL.db_out, SQL::OPEN_URI_RWC, nil)
-      if rc != SQL::OK
-        # Best-effort error surface — sqlite3_errmsg requires a valid db
-        # handle, which we don't have on open failure. The numeric rc +
-        # path are the only signals we can raise pre-handle.
-        raise "Db.configure: sqlite3_open(" + path + ") failed (" + rc.to_s + ")"
+    begin
+      while i < n
+        rc = SQL.sqlite3_open_v2(path, SQL.db_out, SQL::OPEN_URI_RWC, nil)
+        dbh = SQL.read_ptr(SQL.db_out)
+        if rc != SQL::OK
+          SQL.sqlite3_close(dbh) unless dbh.nil?
+          raise "Db.configure: sqlite3_open(" + path + ") failed (" + rc.to_s + ")"
+        end
+        @conns.push(DbConn.new(dbh))
+        if SQL.sqlite3_exec(dbh, "PRAGMA foreign_keys=ON", nil, nil, nil) != SQL::OK
+          raise "Db.configure: foreign key enforcement could not be enabled"
+        end
+        if SQL.sqlite3_prepare_v2(dbh, "PRAGMA foreign_keys", -1, SQL.stmt_out, nil) != SQL::OK
+          raise "Db.configure: foreign key enforcement could not be verified"
+        end
+        enforcement = SQL.read_ptr(SQL.stmt_out)
+        enabled = SQL.sqlite3_step(enforcement) == SQL::ROW && SQL.sqlite3_column_int(enforcement, 0) == 1
+        SQL.sqlite3_finalize(enforcement)
+        unless enabled
+          raise "Db.configure: SQLite foreign key enforcement is unavailable"
+        end
+        PRAGMAS.each { |p| SQL.sqlite3_exec(dbh, p, nil, nil, nil) }
+        @free.push(i)
+        i += 1
       end
-      dbh = SQL.read_ptr(SQL.db_out)
-      # Deliberately not raising on a refused pragma. Every one of these is an
-      # optimization or a politeness; none changes a query's RESULT. A build of
-      # sqlite that declines one (journal_mode=WAL on a read-only mount, say)
-      # should still serve, slower, rather than fail to boot — and a pragma
-      # that silently did nothing is what the numbers above would reveal.
-      PRAGMAS.each { |p| SQL.sqlite3_exec(dbh, p, nil, nil, nil) }
-      @conns.push(DbConn.new(dbh))
-      @free.push(i)
-      i += 1
+    rescue StandardError => error
+      close_all
+      raise error
     end
   end
 
@@ -857,9 +867,15 @@ module Db
     per = n / stripes
     per = 1 if per < 1
     i = 0
-    while i < stripes
-      @pools.push(DbPool.new(path, per))
-      i += 1
+    begin
+      while i < stripes
+        @pools.push(DbPool.new(path, per))
+        i += 1
+      end
+    rescue StandardError => error
+      @pools.each { |pool| pool.close_all }
+      @pools = []
+      raise error
     end
     @assign_lock = Mutex.new
     @next_pool = 0

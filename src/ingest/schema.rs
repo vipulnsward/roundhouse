@@ -76,7 +76,9 @@ pub fn ingest_schema(source: &[u8], file: &str) -> IngestResult<Schema> {
                     .arguments()
                     .map(|a| a.arguments().iter().collect())
                     .unwrap_or_default();
-                apply_add_foreign_key(&args, &mut schema);
+                if let Err(gap) = apply_add_foreign_key(&args, &mut schema, file) {
+                    gaps.push(gap);
+                }
             }
             _ => {}
         }
@@ -162,6 +164,11 @@ const UNSUPPORTED_VERBS: &[&str] = &[
     "reversible",
     "revert",
     "up_only",
+    "add_check_constraint",
+    "remove_check_constraint",
+    "validate_check_constraint",
+    "remove_foreign_key",
+    "validate_foreign_key",
 ];
 
 fn apply_migration_verb(
@@ -180,6 +187,11 @@ fn apply_migration_verb(
         });
     }
 
+    if matches!(verb, "drop_table" | "rename_table" | "change_column" | "remove_column" | "rename_column" | "remove_reference" | "remove_belongs_to")
+        && schema.tables.values().any(|table| !table.constraints.generated_columns.is_empty() || !table.constraints.composite_foreign_keys.is_empty() || !table.constraints.checks.is_empty())
+    {
+        return Err(IngestError::Unsupported { file: file.into(), message: format!("migration verb `{verb}` requires materialized db/schema.rb to preserve generated and referential constraints") });
+    }
     let args: Vec<Node<'_>> = call
         .arguments()
         .map(|a| a.arguments().iter().collect())
@@ -218,6 +230,8 @@ fn apply_migration_verb(
                     // change_column replaces; add_column after a
                     // replace-shaped history stays idempotent.
                     table.columns.retain(|x| x.name != col.name);
+                    table.constraints.generated_columns.shift_remove(&col.name);
+                    if let Some(generated) = opts.generated { table.constraints.generated_columns.insert(col.name.clone(), generated); }
                     table.columns.push(col);
                 }
             }
@@ -324,7 +338,7 @@ fn apply_migration_verb(
         // conversion emits real `foreign_key` migration lines from it).
         // Column typing itself is unaffected: the FK column is already an
         // ordinary integer column from `create_table`.
-        "add_foreign_key" => apply_add_foreign_key(&args, schema),
+        "add_foreign_key" => apply_add_foreign_key(&args, schema, file)?,
         // Extensions (and FK removal — schema.rb is canonical state, so
         // a remove would only appear in migration folds where the add is
         // also seen) don't affect column typing; skipped like before.
@@ -347,6 +361,12 @@ fn refuse_predicate_column(
     column: &str,
     file: &str,
 ) -> Result<(), IngestError> {
+    if !table.constraints.generated_columns.is_empty() || !table.constraints.composite_foreign_keys.is_empty() || !table.constraints.checks.is_empty() {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: format!("migration verb `{verb}` on {}.{column} requires materialized db/schema.rb to preserve constraints", table.name),
+        });
+    }
     let Some(index) = table
         .indexes
         .iter()
@@ -447,24 +467,64 @@ fn table_name_value(node: &Node<'_>) -> Option<String> {
 /// Shared by the schema.rb walk and the migration fold; column typing
 /// itself is unaffected (the FK column is already an ordinary integer
 /// column from `create_table`).
-fn apply_add_foreign_key(args: &[Node<'_>], schema: &mut Schema) {
+fn apply_add_foreign_key(args: &[Node<'_>], schema: &mut Schema, file: &str) -> IngestResult<()> {
     let arg_name = |i: usize| args.get(i).and_then(table_name_value);
-    let (Some(from_t), Some(to_t)) = (arg_name(0), arg_name(1)) else { return };
-    let kw = |key: &str| kwarg_value(args.iter().skip(2), key).and_then(|v| name_value(&v));
-    let from_column =
-        kw("column").unwrap_or_else(|| format!("{}_id", crate::naming::singularize(&to_t)));
-    let to_column = kw("primary_key").unwrap_or_else(|| "id".to_string());
-    let on_delete = kw("on_delete").map(|s| referential_action(&s)).unwrap_or_default();
-    let on_update = kw("on_update").map(|s| referential_action(&s)).unwrap_or_default();
-    if let Some(table) = schema.tables.get_mut(&Symbol::from(from_t)) {
-        table.foreign_keys.push(crate::schema::ForeignKey {
-            from_column: Symbol::from(from_column),
-            to_table: TableRef(Symbol::from(to_t)),
-            to_column: Symbol::from(to_column),
-            on_delete,
-            on_update,
-        });
+    let (Some(from_t), Some(to_t)) = (arg_name(0), arg_name(1)) else {
+        return Err(IngestError::Unsupported { file: file.into(), message: "foreign key tables must be literal".into() });
+    };
+    if !schema.tables.contains_key(&Symbol::from(from_t.clone())) || !schema.tables.contains_key(&Symbol::from(to_t.clone())) {
+        return Err(IngestError::Unsupported { file: file.into(), message: format!("foreign key {from_t}->{to_t} names an absent table") });
     }
+    for node in args.iter().skip(2) {
+        let Some(hash) = node.as_keyword_hash_node() else {
+            return Err(IngestError::Unsupported { file: file.into(), message: "foreign key options must be keyword literals".into() });
+        };
+        for element in hash.elements().iter() {
+            let Some(assoc) = element.as_assoc_node() else {
+                return Err(IngestError::Unsupported { file: file.into(), message: "dynamic foreign key options are unsupported".into() });
+            };
+            let key = symbol_value(&assoc.key()).unwrap_or_default();
+            if !matches!(key.as_str(), "column" | "primary_key" | "on_delete" | "on_update" | "name") {
+                return Err(IngestError::Unsupported { file: file.into(), message: format!("foreign key option `{key}` is unsupported") });
+            }
+        }
+    }
+    let names = |key: &str, fallback: String| -> IngestResult<Vec<Symbol>> {
+        let Some(value) = kwarg_value(args.iter().skip(2), key) else { return Ok(vec![Symbol::from(fallback)]) };
+        let values: Option<Vec<Symbol>> = if let Some(array) = value.as_array_node() {
+            array.elements().iter().map(|n| name_value(&n).map(Symbol::from)).collect()
+        } else {
+            name_value(&value).map(|name| vec![Symbol::from(name)])
+        };
+        values.filter(|v| !v.is_empty()).ok_or_else(|| IngestError::Unsupported { file: file.into(), message: format!("foreign key {from_t}->{to_t} has dynamic or empty {key}") })
+    };
+    let from_columns = names("column", format!("{}_id", crate::naming::singularize(&to_t)))?;
+    let to_columns = names("primary_key", "id".into())?;
+    if from_columns.len() != to_columns.len() {
+        return Err(IngestError::Unsupported { file: file.into(), message: format!("foreign key {from_t}->{to_t} has unequal column arity") });
+    }
+    let action = |key: &str| -> IngestResult<crate::schema::ReferentialAction> {
+        let Some(value) = kwarg_value(args.iter().skip(2), key) else { return Ok(Default::default()) };
+        let name = name_value(&value).unwrap_or_default();
+        if !matches!(name.as_str(), "cascade" | "nullify" | "restrict" | "no_action") {
+            return Err(IngestError::Unsupported { file: file.into(), message: format!("foreign key action `{key}: {name}` is unsupported") });
+        }
+        Ok(referential_action(&name))
+    };
+    if let Some(table) = schema.tables.get_mut(&Symbol::from(from_t)) {
+        if from_columns.len() == 1 {
+            table.foreign_keys.push(crate::schema::ForeignKey {
+                from_column: from_columns[0].clone(), to_table: TableRef(Symbol::from(to_t)), to_column: to_columns[0].clone(),
+                on_delete: action("on_delete")?, on_update: action("on_update")?,
+            });
+        } else {
+            table.constraints.composite_foreign_keys.push(crate::schema::CompositeForeignKey {
+                from_columns, to_table: TableRef(Symbol::from(to_t)), to_columns,
+                on_delete: action("on_delete")?, on_update: action("on_update")?,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// `on_delete:`/`on_update:` symbol → the neutral referential action.
@@ -616,9 +676,10 @@ fn table_from_create_table(
 
     let mut columns = Vec::new();
     let mut indexes: Vec<Index> = Vec::new();
+    let mut constraints = crate::schema::TableConstraints::default();
     if has_id {
         let id_limit = hash_limit.unwrap_or(outer_limit);
-        let opts = ColumnOpts { nullable: Some(false), default: None, limit: id_limit };
+        let opts = ColumnOpts { nullable: Some(false), default: None, limit: id_limit, ..Default::default() };
         // `serial` and `bigserial` are the integer keys Postgres fills
         // from a sequence: Rails' PostgreSQL adapter makes `id: :integer`
         // a `serial`, and dumps it as `id: :serial`. An integer key with
@@ -671,13 +732,40 @@ fn table_from_create_table(
                             if let Some(idx) = index_from_call(&call, &table_name) {
                                 indexes.push(idx);
                             }
+                        } else if call_name == "check_constraint" {
+                            let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                            let options_valid = args.iter().skip(1).all(|node| {
+                                node.as_keyword_hash_node().is_some_and(|hash| hash.elements().iter().all(|element| {
+                                    element.as_assoc_node().is_some_and(|assoc| symbol_value(&assoc.key()).as_deref() == Some("name") && name_value(&assoc.value()).is_some())
+                                }))
+                            });
+                            if !options_valid {
+                                gaps.push(IngestError::Unsupported { file: file.into(), message: format!("unsupported check constraint options on {table_name}") });
+                                continue;
+                            }
+                            match args.first().and_then(string_value) {
+                                Some(expression) => constraints.checks.push(crate::schema::CheckConstraint {
+                                    name: kwarg_value(args.iter().skip(1), "name").and_then(|n| name_value(&n)).map(Symbol::from),
+                                    expression,
+                                }),
+                                None => gaps.push(IngestError::Unsupported { file: file.into(), message: format!("dynamic check constraint on {table_name}") }),
+                            }
+                        } else if matches!(call_name.as_str(), "foreign_key" | "exclusion_constraint" | "unique_constraint") {
+                            gaps.push(IngestError::Unsupported { file: file.into(), message: format!("table-level constraint `{call_name}` on {table_name} is not modeled") });
                         } else if call_name == "timestamps" {
                             // Migration macro; schema.rb has these
                             // already materialized as two datetimes.
                             columns.extend(timestamp_columns());
                         } else {
                             match column_from_call(&call, &table_name, file) {
-                                Ok(Some(col)) => columns.push(col),
+                                Ok(Some(col)) => {
+                                    if call_name == "virtual" {
+                                        let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                                        let opts = parse_column_opts(args.iter().skip(1));
+                                        constraints.generated_columns.insert(col.name.clone(), opts.generated.unwrap());
+                                    }
+                                    columns.push(col);
+                                },
                                 Ok(None) => {}
                                 Err(gap) => gaps.push(gap),
                             }
@@ -699,6 +787,7 @@ fn table_from_create_table(
             columns,
             indexes,
             foreign_keys: vec![],
+            constraints,
             virtual_module: None,
         },
     ))
@@ -744,6 +833,7 @@ fn virtual_table_from_call(call: &ruby_prism::CallNode<'_>) -> Option<(Symbol, T
             columns,
             indexes: vec![],
             foreign_keys: vec![],
+            constraints: Default::default(),
             virtual_module: Some(crate::schema::VirtualModule { module, args: module_args }),
         },
     ))
@@ -785,6 +875,7 @@ fn view_from_create_view(
             columns,
             indexes: vec![],
             foreign_keys: vec![],
+            constraints: Default::default(),
             virtual_module: None,
         },
     ))
@@ -922,6 +1013,9 @@ struct ColumnOpts {
     nullable: Option<bool>,
     default: Option<String>,
     limit: Option<u32>,
+    value_type: Option<String>,
+    generated: Option<crate::schema::GeneratedColumn>,
+    generated_options_invalid: bool,
 }
 
 // Not `string_value` alone: schema.rb dumps an integer, float or boolean default unquoted (`default: 0`, `default: true`).
@@ -937,13 +1031,21 @@ fn default_value(node: &Node<'_>) -> Option<String> {
 
 fn parse_column_opts<'pr>(nodes: impl Iterator<Item = &'pr Node<'pr>>) -> ColumnOpts {
     let mut opts = ColumnOpts::default();
+    let mut expression = None;
+    let mut stored = None;
     for node in nodes {
-        let Some(kh) = node.as_keyword_hash_node() else { continue };
+        let Some(kh) = node.as_keyword_hash_node() else { opts.generated_options_invalid = true; continue };
         for el in kh.elements().iter() {
-            let Some(assoc) = el.as_assoc_node() else { continue };
-            let Some(key) = symbol_value(&assoc.key()) else { continue };
+            let Some(assoc) = el.as_assoc_node() else { opts.generated_options_invalid = true; continue };
+            let Some(key) = symbol_value(&assoc.key()) else { opts.generated_options_invalid = true; continue };
             let value = &assoc.value();
+            if !matches!(key.as_str(), "type" | "as" | "stored" | "null") || (key == "null" && bool_value(value).is_none()) {
+                opts.generated_options_invalid = true;
+            }
             match key.as_str() {
+                "type" => opts.value_type = name_value(value),
+                "as" => expression = string_value(value),
+                "stored" => stored = bool_value(value),
                 "null" => opts.nullable = bool_value(value),
                 "default" => opts.default = default_value(value),
                 "limit" => {
@@ -957,6 +1059,7 @@ fn parse_column_opts<'pr>(nodes: impl Iterator<Item = &'pr Node<'pr>>) -> Column
             }
         }
     }
+    opts.generated = expression.zip(stored).map(|(expression, stored)| crate::schema::GeneratedColumn { expression, stored });
     opts
 }
 
@@ -977,6 +1080,15 @@ fn column_with_type(
     table: &str,
     file: &str,
 ) -> Result<Column, IngestError> {
+    if type_name == "virtual" {
+        let Some(value_type) = opts.value_type.as_deref().filter(|t| *t != "virtual") else {
+            return Err(IngestError::Unsupported { file: file.into(), message: format!("generated column {table}.{col_name} requires a literal underlying type") });
+        };
+        if opts.generated.is_none() || opts.default.is_some() || opts.generated_options_invalid || !matches!(value_type, "bigint" | "integer") {
+            return Err(IngestError::Unsupported { file: file.into(), message: format!("generated column {table}.{col_name} requires a literal expression, explicit stored mode, and no default") });
+        }
+        return column_with_type(value_type, col_name, opts, table, file);
+    }
     let col_type = match type_name {
         "integer" => ColumnType::Integer,
         "bigint" => ColumnType::BigInt,

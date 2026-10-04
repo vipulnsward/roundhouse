@@ -24,6 +24,8 @@ pub struct Table {
     pub columns: Vec<Column>,
     pub indexes: Vec<Index>,
     pub foreign_keys: Vec<ForeignKey>,
+    #[serde(default)]
+    pub constraints: TableConstraints,
     /// `create_virtual_table "message_search_index", "fts5", ["body",
     /// "tokenize=porter"]` — a table the DB builds from a MODULE rather
     /// than from a column list. It has no rowid column of its own, no
@@ -42,6 +44,34 @@ pub struct Table {
 pub struct VirtualModule {
     pub module: String,
     pub args: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct TableConstraints {
+    pub generated_columns: IndexMap<Symbol, GeneratedColumn>,
+    pub composite_foreign_keys: Vec<CompositeForeignKey>,
+    pub checks: Vec<CheckConstraint>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GeneratedColumn {
+    pub expression: String,
+    pub stored: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CompositeForeignKey {
+    pub from_columns: Vec<Symbol>,
+    pub to_table: TableRef,
+    pub to_columns: Vec<Symbol>,
+    pub on_delete: ReferentialAction,
+    pub on_update: ReferentialAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CheckConstraint {
+    pub name: Option<Symbol>,
+    pub expression: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

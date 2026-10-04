@@ -89,29 +89,43 @@ module Db
     # takes the gem's defaults, which are the same flags minus URI.
     flags = SQLite3::Constants::Open::READWRITE | SQLite3::Constants::Open::CREATE
     flags |= SQLite3::Constants::Open::URI if path.start_with?("file:")
-    ActiveRecord::ConnectionAdapters::ConnectionPool.new(@pool_size) do
-      db = SQLite3::Database.new(path, flags: flags)
-      db.results_as_hash = false
-      # PINNED, not inherited. This lane reads `synchronous = NORMAL`
-      # today without asking for it, because the sqlite3 gem's bundled
-      # SQLite defaults WAL that way — while the binary's own SQLite
-      # defaults to FULL, which cost the spinel lane 5.5s on a
-      # 1,000-socket connect storm (one fsync per presence write; see
-      # runtime/spinel/db.rb's PRAGMAS). Three lanes agreeing by
-      # compile-time accident is not agreement, so each states it.
-      db.execute("PRAGMA journal_mode=WAL")
-      db.execute("PRAGMA synchronous=NORMAL")
-      # The gem's default is 0: a second writer fails at once with
-      # SQLITE_BUSY. Rails' database.yml says `timeout: 5000`, and so do
-      # the binary's PRAGMAS — the harness's file database (see
-      # test/test_helper.rb) relies on writers waiting.
-      db.busy_timeout = 5000
-      # The app's SQL functions (`create_function` / `create_aggregate`
-      # in an initializer), per connection as Rails' adapter registers
-      # them. Defined only when the app has some (runtime/sql_functions.rb
-      # is generated for it).
-      SqlFunctions.install(db) if defined?(SqlFunctions)
-      db
+    opened = []
+    begin
+      ActiveRecord::ConnectionAdapters::ConnectionPool.new(@pool_size) do
+        db = SQLite3::Database.new(path, flags: flags)
+        opened << db
+        db.results_as_hash = false
+        begin
+          db.execute("PRAGMA foreign_keys=ON")
+          raise "SQLite foreign key enforcement is unavailable" unless db.get_first_value("PRAGMA foreign_keys") == 1
+        rescue StandardError
+          db.close
+          raise
+        end
+        # PINNED, not inherited. This lane reads `synchronous = NORMAL`
+        # today without asking for it, because the sqlite3 gem's bundled
+        # SQLite defaults WAL that way — while the binary's own SQLite
+        # defaults to FULL, which cost the spinel lane 5.5s on a
+        # 1,000-socket connect storm (one fsync per presence write; see
+        # runtime/spinel/db.rb's PRAGMAS). Three lanes agreeing by
+        # compile-time accident is not agreement, so each states it.
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA synchronous=NORMAL")
+        # The gem's default is 0: a second writer fails at once with
+        # SQLITE_BUSY. Rails' database.yml says `timeout: 5000`, and so do
+        # the binary's PRAGMAS — the harness's file database (see
+        # test/test_helper.rb) relies on writers waiting.
+        db.busy_timeout = 5000
+        # The app's SQL functions (`create_function` / `create_aggregate`
+        # in an initializer), per connection as Rails' adapter registers
+        # them. Defined only when the app has some (runtime/sql_functions.rb
+        # is generated for it).
+        SqlFunctions.install(db) if defined?(SqlFunctions)
+        db
+      end
+    rescue StandardError
+      opened.each { |db| db.close unless db.closed? }
+      raise
     end
   end
 

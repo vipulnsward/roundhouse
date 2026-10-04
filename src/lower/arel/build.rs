@@ -669,6 +669,7 @@ mod tests {
                 ],
                 indexes: vec![],
                 foreign_keys: vec![],
+                constraints: Default::default(),
                 virtual_module: None,
             },
         );
