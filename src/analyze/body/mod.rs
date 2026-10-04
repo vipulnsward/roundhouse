@@ -108,6 +108,7 @@ pub struct Ctx {
 /// Rails schema + conventions; the body-typer reads it.
 #[derive(Default, Clone)]
 pub struct ClassInfo {
+    pub inferred_block_params: HashMap<Symbol, Vec<Ty>>,
     /// If this class maps to a database table, which one.
     pub table: Option<crate::ident::TableRef>,
     /// Instance-state shape (columns + attr_accessor).
@@ -1021,6 +1022,19 @@ impl<'a> BodyTyper<'a> {
                     };
                     let e = &mut exprs[i];
                     last = self.analyze_expr(e, &local_ctx);
+                    if let ExprNode::Send { recv, method, block: Some(block), .. } = &*e.node {
+                        let receiver = recv.as_ref().and_then(|r| r.ty.as_ref()).or(local_ctx.self_ty.as_ref());
+                        let source_yield = matches!(receiver, Some(Ty::Class { id, .. }) if self.classes().get(id).is_some_and(|c| c.inferred_block_params.contains_key(method)));
+                        if source_yield && matches!(&*block.node, ExprNode::Lambda { .. }) {
+                            let mut writes = HashMap::new();
+                            crate::analyze::extract_ivar_assignments(block, &mut writes);
+                            for (name, ty) in writes {
+                                if ty.is_unknown() { continue; }
+                                let previous = local_ctx.ivar_bindings.remove(&name).unwrap_or(Ty::Nil);
+                                local_ctx.ivar_bindings.insert(name, union_of(previous, ty));
+                            }
+                        }
+                    }
                     if let ExprNode::Assign { target, value } = &*e.node {
                         let slot = match target {
                             LValue::Ivar { name } => Some((true, name.clone())),
@@ -1495,6 +1509,11 @@ impl<'a> BodyTyper<'a> {
 
             ExprNode::MultiAssign { targets, value } => {
                 self.analyze_expr(value, ctx);
+                if let ExprNode::Array { elements, .. } = &*value.node {
+                    if elements.iter().all(|e| !matches!(&*e.node, ExprNode::Splat { .. })) {
+                        value.ty = Some(Ty::Tuple { elems: elements.iter().map(|e| e.ty.clone().unwrap_or_else(unknown)).collect() });
+                    }
+                }
                 for target in targets.iter_mut() {
                     if let LValue::Attr { recv, .. } = target {
                         self.analyze_expr(recv, ctx);

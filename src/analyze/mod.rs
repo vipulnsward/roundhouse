@@ -41,6 +41,7 @@ mod effects;
 mod diagnostics;
 pub(crate) mod forwarding;
 mod inferred_types;
+mod source_yield;
 pub mod inquiry;
 pub use inferred_types::inferred_types;
 pub use inquiry::inquirer_methods;
@@ -1150,7 +1151,15 @@ impl Analyzer {
                     .or_else(|| effective_return_ty(&method.body))
                     .filter(|t| !matches!(t, Ty::Var { .. } | Ty::Untyped));
 
-                if !has_params && ret.is_none() {
+                let block = registered.and_then(|ci| ci.inferred_block_params.get(&method.name)).map(|types| {
+                    Box::new(Ty::Fn {
+                        params: types.iter().enumerate().map(|(i, ty)| crate::ty::Param { name: Symbol::from(format!("yielded_{i}")), ty: ty.clone(), kind: ParamKind::Required }).collect(),
+                        block: None,
+                        ret: Box::new(Ty::Untyped),
+                        effects: Default::default(),
+                    })
+                });
+                if !has_params && ret.is_none() && block.is_none() {
                     continue;
                 }
 
@@ -1184,7 +1193,7 @@ impl Analyzer {
                     .collect();
                 method.signature = Some(Ty::Fn {
                     params,
-                    block: None,
+                    block,
                     ret: Box::new(ret.unwrap_or(Ty::Untyped)),
                     effects: method.effects.clone(),
                 });
@@ -3258,6 +3267,11 @@ impl Analyzer {
             for m in method_keys {
                 parts.push(format!("{}#{}={:?}", cid.0.as_str(), m.as_str(), cls.instance_methods[m]));
             }
+            let mut yield_keys: Vec<&Symbol> = cls.inferred_block_params.keys().collect();
+            yield_keys.sort_by_key(|k| k.as_str().to_string());
+            for m in yield_keys {
+                parts.push(format!("{}~yield:{}={:?}", cid.0.as_str(), m.as_str(), cls.inferred_block_params[m]));
+            }
             let mut cmethod_keys: Vec<&Symbol> = cls.class_methods.keys().collect();
             cmethod_keys.sort_by_key(|k| k.as_str().to_string());
             for m in cmethod_keys {
@@ -3282,6 +3296,7 @@ impl Analyzer {
     /// body is `Ty::Var` (no information gained).
     fn harvest_returns_to_registry(&mut self, app: &App) {
         self.harvest_method_returns(app);
+        self.harvest_source_yields(app);
         // Rails' `helper_method :name` makes a controller (or concern)
         // method callable from templates. The names were ingested from
         // both spellings (`App::view_visible_controller_methods`); the

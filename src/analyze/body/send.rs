@@ -404,6 +404,11 @@ impl<'a> BodyTyper<'a> {
                             // against the class the walk started from,
                             // as dispatch does.
                             let self_ty = Ty::Class { id: id.clone(), args: Vec::new() };
+                            if !matches!(sig, Ty::Fn { .. }) {
+                                if let Some(params) = c.inferred_block_params.get(method) {
+                                    return Some(params.clone());
+                                }
+                            }
                             return match sig {
                                 // A block that yields SEVERAL values
                                 // names them in its own `Ty::Fn`

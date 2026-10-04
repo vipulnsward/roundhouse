@@ -3224,3 +3224,70 @@ end
         .run_ruby("require_relative \"runtime/active_job\"\nrequire_relative \"test/models/hash_query_test\"\n")
         .assert_passes();
 }
+
+#[test]
+fn source_yield_record_tuple_and_denial_execute() {
+    let run = emit_and_run::real_blog()
+        .edit("db/schema.rb", "  create_table \"articles\", force: :cascade do |t|", "  create_table \"yield_records\" do |t|\n    t.string \"title\", null: false\n  end\n  create_table \"articles\", force: :cascade do |t|")
+        .write("app/models/yield_record.rb", "class YieldRecord < ApplicationRecord\nend\n")
+        .write("app/services/source_yield_probe.rb", r#"class SourceYieldProbe
+  def self.record(id, allowed, produce)
+    raise "denied" unless allowed
+    return nil unless produce
+    yield YieldRecord.find(id)
+  end
+  def self.tuple(id, allowed, produce)
+    record(id, allowed, produce) do |record|
+      yield record, "window", 7
+    end
+  end
+end
+"#)
+        .edit("config/routes.rb", "Rails.application.routes.draw do", "Rails.application.routes.draw do\n  get \"/source-yield\" => \"source_yields#index\"\n  get \"/source-yield-empty\" => \"source_yields#empty\"\n  get \"/source-yield-denied\" => \"source_yields#denied\"")
+        .write("app/controllers/source_yields_controller.rb", r#"class SourceYieldsController < ApplicationController
+  def index
+    SourceYieldProbe.tuple(1, true, true) { |record, label, count| @record, @label, @count = record, label, count }
+    if @record && @label && @count
+      render plain: @record.title + @label.to_s + @count.to_s
+    else
+      render plain: "empty"
+    end
+  end
+  def empty
+    @record = nil
+    SourceYieldProbe.record(1, true, false) { |record| @record = record }
+    render plain: @record ? @record.title : "empty"
+  end
+  def denied
+    SourceYieldProbe.record(1, false, true) { |record| @record = record }
+    render plain: @record.title
+  rescue RuntimeError
+    render plain: "denied", status: :forbidden
+  end
+end
+"#)
+        .run_ruby(r#"
+row = YieldRecord.create!(title: "synthetic")
+raise "unexpected fixture id" unless row.id == 1
+observations = []
+[["/source-yield", 200, "syntheticwindow7"], ["/source-yield-empty", 200, "empty"], ["/source-yield-denied", 403, "denied"]].each do |path, expected_status, expected_body|
+  status, headers, body = Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => path, "QUERY_STRING" => "", "rack.input" => StringIO.new(""))
+  rendered = body.join
+  raise "wrong status: #{path}:#{status}" unless status == expected_status
+  raise "wrong body: #{path}:#{rendered}" unless rendered == expected_body
+  observations << rendered
+end
+missing_count = 0
+begin
+  SourceYieldProbe.record(999_999, true, true) { |record| missing_count += 1 }
+  raise "missing row accepted"
+rescue ActiveRecord::RecordNotFound
+end
+raise "missing row yielded" unless missing_count == 0
+raise "read mutated synthetic fixture" unless YieldRecord.count == 1 && row.reload.title == "synthetic"
+puts "source yield route checks passed"
+"#)
+        ;
+    println!("emitted source-yield execution success={}\nstdout={}\nstderr={}", run.success, run.stdout, run.stderr);
+    run.assert_passes();
+}
