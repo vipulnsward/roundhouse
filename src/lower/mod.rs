@@ -90,6 +90,7 @@ pub mod as_json_super;
 pub mod parameterize;
 pub mod random_formatter;
 pub mod to_json;
+pub mod hash_to_query;
 pub mod number_to_fs;
 pub mod string_inflections;
 pub mod attribute_aliases;
@@ -418,6 +419,7 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     ("status_literal", &[]),
     // `"#{v.to_param}"` on an untyped receiver → `ActiveSupport.to_param(v)`.
     ("to_param_residue", &[]),
+    ("hash_to_query", &[]),
     // `x.exclude?(y)` → `!x.include?(y)`; total rewrite, no ordering
     // constraints (no other pass produces or consumes `exclude?`).
     ("exclude_predicate", &[]),
@@ -809,6 +811,8 @@ pub fn apply_post_analyze_lowerings(
     ran!("status_literal");
     to_param_residue::apply_to_param_residue_lowering(app);
     ran!("to_param_residue");
+    hash_to_query::apply_hash_to_query_lowering(app);
+    ran!("hash_to_query");
     exclude_predicate::apply_exclude_predicate_lowering(app);
     ran!("exclude_predicate");
     in_predicate::apply_in_predicate_lowering(app);

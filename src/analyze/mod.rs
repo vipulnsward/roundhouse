@@ -29,6 +29,7 @@ pub(crate) use body::string_answers;
 pub(crate) use body::ConstResolverTask;
 pub use body::PreparedConstResolver;
 pub mod async_color;
+pub(crate) mod query_encoding;
 pub mod attribution;
 pub mod preload;
 pub mod block_refine;

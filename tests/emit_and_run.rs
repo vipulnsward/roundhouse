@@ -3119,3 +3119,108 @@ end
         )
         .assert_passes();
 }
+
+#[test]
+fn hash_to_query_preserves_native_callback_and_nested_encoding() {
+    emit_and_run::real_blog()
+        .write(
+            "app/lib/native_callback_query_probe.rb",
+            r#"class NativeCallbackQueryProbe
+  def self.callback(code, state)
+    { code: code, state: state }.to_query
+  end
+  def self.nested
+    { z: "last", a: { values: ["x+y", "a&b"], name: "पुणे 😀" }, empty: [], absent: nil }.to_query
+  end
+  def self.namespaced
+    { b: "2", a: "1" }.to_query("return")
+  end
+  def self.control
+    { "k\u0000\n" => "v\r\t\u007F" }.to_query
+  end
+  def self.empty_namespace
+    { b: "2", a: "1" }.to_query("")
+  end
+  def self.array_namespace
+    { b: "2", a: "1" }.to_query("items[]")
+  end
+  def self.nil_namespace
+    { b: "2", a: "1" }.to_query(nil)
+  end
+  def self.empty_array_in_array
+    { a: [[]] }.to_query
+  end
+  def self.empty_array_mixed
+    { a: [[], "x"] }.to_query
+  end
+  def self.empty_hash_mixed
+    { a: [{}, "x"] }.to_query
+  end
+  def self.mixed_scalars
+    { a: [false, true, 0, 2.5, nil, "", :ready] }.to_query
+  end
+  def self.punctuation
+    { k: " ~!*()\u0000\n+&=#%/?:[]" }.to_query
+  end
+  def self.encoded_keys
+    { "é" => "a", "a b" => "b", x: "symbol", "x" => "string" }.to_query
+  end
+  def self.empty_rendered_array_pair
+    { a: { e: [] }, b: "x" }.to_query
+  end
+  def self.empty_rendered_hash_pair
+    { a: { e: {} }, b: "x" }.to_query
+  end
+  def self.empty_key
+    { "" => nil, "b" => "x" }.to_query
+  end
+  def self.empty_rendered_array_element
+    { a: [{ e: [] }, "x"] }.to_query
+  end
+end
+"#,
+        )
+        .write("sig/native_callback_query_probe.rbs", "class NativeCallbackQueryProbe\n  def self.callback: (String code, String state) -> String\nend\n")
+        .run_ruby(r#"
+def verify_query(expected, actual)
+  raise "query mismatch: #{actual.inspect}" unless expected == actual
+end
+verify_query("code=a%2Bb%26state%3Dinjected%23fragment&state=%E0%A4%AA%E0%A5%81%E0%A4%A3%E0%A5%87+%F0%9F%98%80", NativeCallbackQueryProbe.callback("a+b&state=injected#fragment", "पुणे 😀"))
+verify_query("a%5Bname%5D=%E0%A4%AA%E0%A5%81%E0%A4%A3%E0%A5%87+%F0%9F%98%80&a%5Bvalues%5D%5B%5D=x%2By&a%5Bvalues%5D%5B%5D=a%26b&absent&z=last", NativeCallbackQueryProbe.nested)
+verify_query("return%5Ba%5D=1&return%5Bb%5D=2", NativeCallbackQueryProbe.namespaced)
+verify_query("k%00%0A=v%0D%09%7F", NativeCallbackQueryProbe.control)
+verify_query("%5Ba%5D=1&%5Bb%5D=2", NativeCallbackQueryProbe.empty_namespace)
+verify_query("items%5B%5D%5Bb%5D=2&items%5B%5D%5Ba%5D=1", NativeCallbackQueryProbe.array_namespace)
+verify_query("a=1&b=2", NativeCallbackQueryProbe.nil_namespace)
+verify_query("a%5B%5D%5B%5D", NativeCallbackQueryProbe.empty_array_in_array)
+verify_query("a%5B%5D%5B%5D&a%5B%5D=x", NativeCallbackQueryProbe.empty_array_mixed)
+verify_query("&a%5B%5D=x", NativeCallbackQueryProbe.empty_hash_mixed)
+verify_query("a%5B%5D=false&a%5B%5D=true&a%5B%5D=0&a%5B%5D=2.5&a%5B%5D&a%5B%5D=&a%5B%5D=ready", NativeCallbackQueryProbe.mixed_scalars)
+verify_query("k=+~%21%2A%28%29%00%0A%2B%26%3D%23%25%2F%3F%3A%5B%5D", NativeCallbackQueryProbe.punctuation)
+verify_query("%C3%A9=a&a+b=b&x=string&x=symbol", NativeCallbackQueryProbe.encoded_keys)
+verify_query("&b=x", NativeCallbackQueryProbe.empty_rendered_array_pair)
+verify_query("&b=x", NativeCallbackQueryProbe.empty_rendered_hash_pair)
+verify_query("&b=x", NativeCallbackQueryProbe.empty_key)
+verify_query("&a%5B%5D=x", NativeCallbackQueryProbe.empty_rendered_array_element)
+puts "native callback query encoding checks passed"
+
+"#)
+        .assert_passes();
+}
+
+#[test]
+fn hash_to_query_in_emitted_test_bodies_uses_the_runtime() {
+    emit_and_run::empty_app()
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"query_rows\" do |t|\n    t.string \"name\"\n  end\nend\n")
+        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+        .write("test/models/hash_query_test.rb", r#"require "test_helper"
+class HashQueryTest < ActiveSupport::TestCase
+  test "query encoding in a test body" do
+    assert_equal "a=x%2By&b=one+two", { b: "one two", a: "x+y" }.to_query
+  end
+end
+"#)
+        .run_ruby("require_relative \"runtime/active_job\"\nrequire_relative \"test/models/hash_query_test\"\n")
+        .assert_passes();
+}

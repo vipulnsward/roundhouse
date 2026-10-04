@@ -909,6 +909,13 @@ impl<'a> BodyTyper<'a> {
                 {
                     return Ty::Str;
                 }
+                if method.as_str() == "to_query" && matches!(recv_ty, Some(Ty::Hash { .. })) {
+                    return if recv.as_ref().is_some_and(|r| crate::analyze::query_encoding::supported_call(r, args, block.is_some())) {
+                        Ty::Str
+                    } else {
+                        unknown()
+                    };
+                }
                 let dispatched = self.dispatch(recv_ty.as_ref(), method, block_ret.as_ref(), args);
                 // Kernel.Array is a container even for scalar params.
                 // App methods (including inherited/included overrides)

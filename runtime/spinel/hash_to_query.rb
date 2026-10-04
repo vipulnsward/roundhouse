@@ -1,3 +1,5 @@
+require_relative "cgi_io"
+
 # `Hash#to_query`'s nested grammar and ordering, for the ruby family: a
 # Hash value renders as `outer[inner]=…`, an Array as repeated
 # `key[]=…`, an empty container as nothing, and the strings at each
@@ -23,14 +25,19 @@
 # { push_subscription: { … } })`.
 module ActionView
   module ViewHelpers
+    def self.url_encode(s)
+      CgiIo.url_encode(s).gsub("%20", "+")
+    end
+
     def self.to_query_pairs(params, namespace)
       pairs = []
       params.each do |key, value|
-        name = namespace.empty? ? key.to_s : "#{namespace}[#{key.to_s}]"
+        name = namespace.nil? ? key.to_s : "#{namespace}[#{key.to_s}]"
+        next if (value.is_a?(Hash) || value.is_a?(Array)) && value.empty?
         pair = to_query_value(name, value)
-        pairs << pair unless pair.empty?
+        pairs << pair
       end
-      pairs = pairs.sort unless namespace.include?("[]")
+      pairs = pairs.sort unless namespace.to_s.include?("[]")
       pairs.join("&")
     end
 
@@ -39,6 +46,7 @@ module ActionView
       when Hash
         to_query_pairs(value, name)
       when Array
+        return url_encode("#{name}[]") if value.empty?
         parts = []
         value.each { |v| parts << to_query_value("#{name}[]", v) }
         parts.join("&")

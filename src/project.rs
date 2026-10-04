@@ -941,6 +941,15 @@ pub fn target_files(
     if !matches!(target, BuildTarget::Blog) {
         crate::emit::shared::schema_sql::render_schema_statements_for(&app.schema, crate::emit::shared::schema_sql::Dialect::Sqlite)?;
     }
+    if target != BuildTarget::Blog && crate::lower::hash_to_query::contains_unlowered_app_call(app) {
+        return Err(format!("{}: unlowered Hash#to_query has unproved receiver, arguments or defaults", target.as_str()));
+    }
+    if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Spinel) {
+        let has_hash_query = crate::lower::hash_to_query::contains_app_call(app);
+        if has_hash_query {
+            return Err(format!("{}: Hash#to_query requires the verified Ruby or Spinel query grammar", target.as_str()));
+        }
+    }
     reject_unsupported_dates(app, target)?;
     reject_unsupported_forwarded_procs(app, target)?;
     report_unsupported_keys(app, target);

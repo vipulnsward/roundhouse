@@ -230,8 +230,12 @@ module ActionView
     # for the two lanes that can use it. A poly walk over untyped values
     # and an `Array#sort` are not shapes every strict target's emit
     # answers, and this seam keeps them off those trees.
-    def self.to_query(params)
-      to_query_pairs(params, "")
+    def self.to_query(params, namespace = nil)
+      to_query_pairs(params, namespace)
+    end
+
+    def self.hash_to_query(params, namespace = nil)
+      to_query(params, namespace)
     end
 
     # `NilClass#to_query` is the bare key, no `=`.
@@ -251,7 +255,7 @@ module ActionView
     def self.to_query_pairs(params, namespace)
       pairs = []
       params.each do |key, value|
-        name = namespace.empty? ? key.to_s : "#{namespace}[#{key.to_s}]"
+        name = namespace.nil? ? key.to_s : "#{namespace}[#{key.to_s}]"
         pairs << (value.nil? ? "#{url_encode(name)}" : "#{url_encode(name)}=#{url_encode(value.to_s)}")
       end
       pairs.join("&")

@@ -130,7 +130,7 @@ pub fn ingest_template(
         format: Symbol::from(format),
         locals: Row::closed(),
         body,
-        strict_locals: parse_strict_locals(source),
+        strict_locals: parse_strict_locals(source, file)?,
     })
 }
 
@@ -138,114 +138,91 @@ pub fn ingest_template(
 /// (comment:, was_merged: false, …) -%>` — into ordered KEYWORD
 /// `Param`s. Required locals (`comment:`) get no default; defaulted
 /// ones (`was_merged: false`) carry the parsed literal. Returns `None`
-/// when the template has no such header (the common case). Only the
-/// literal defaults lobsters uses (true/false/nil/int/str/sym) are
-/// modeled; an unrecognized default degrades to `nil` (the param stays
-/// optional, just mis-defaulted — no caller in the corpus hits it).
-fn parse_strict_locals(source: &str) -> Option<Vec<crate::dialect::Param>> {
+fn parse_strict_locals(source: &str, file: &str) -> IngestResult<Option<Vec<crate::dialect::Param>>> {
     use crate::dialect::Param;
-    // The magic comment must be a `<%# … locals: ( … ) … %>` tag. Anchor
-    // on `locals:` and require an enclosing `<%#` comment opener with no
-    // intervening tag close (so a stray `locals:` in body text is ignored).
-    let kw = source.find("locals:")?;
-    let open = source[..kw].rfind("<%#")?;
-    if source[open..kw].contains("%>") {
-        return None;
+    use super::IngestError;
+    use super::util::constant_id_str;
+    let Some(header) = find_strict_locals_header(source) else { return Ok(None); };
+    let signature_source = format!("def __roundhouse_strict_locals__({header})\nend\n");
+    let parsed = ruby_prism::parse(signature_source.as_bytes());
+    if parsed.errors().next().is_some() {
+        return Err(IngestError::Parse { file: file.into(), message: "strict-local signature is not valid Ruby".into() });
     }
-    // Bound the header to THIS comment's close: `%>` after `locals:` ends
-    // the tag (we already know there's none before it). Without this bound
-    // the `(`/`)` scan runs past the comment into unrelated template code,
-    // where a stray paren would hijack the signature (finding: phantom
-    // header). No `%>` after `locals:` at all → not a real header.
-    let close = kw + source[kw..].find("%>")?;
-    let after = &source[kw + "locals:".len()..close];
-    let lp = after.find('(')?;
-    let rest = &after[lp + 1..];
-    let mut depth = 1usize;
-    let mut end = None;
-    for (i, c) in rest.char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = Some(i);
-                    break;
-                }
-            }
-            _ => {}
-        }
+    let program = parsed.node().as_program_node().ok_or_else(|| IngestError::Parse {
+        file: file.into(), message: "strict-local signature has no program".into(),
+    })?;
+    let statements: Vec<_> = program.statements().body().iter().collect();
+    let [statement] = statements.as_slice() else {
+        return Err(IngestError::Unsupported { file: file.into(), message: "strict-local signature contains extra statements".into() });
+    };
+    let definition = statement.as_def_node().ok_or_else(|| IngestError::Parse {
+        file: file.into(), message: "strict-local signature has no method".into(),
+    })?;
+    if definition.body().is_some() {
+        return Err(IngestError::Unsupported { file: file.into(), message: "strict-local signature contains body statements".into() });
     }
-    let inner = &rest[..end?];
+    let Some(parameters) = definition.parameters() else { return Ok(None); };
+    if parameters.optionals().iter().next().is_some() {
+        return Err(IngestError::Unsupported { file: file.into(), message: "strict-local positional optional parameters are not supported".into() });
+    }
     let mut params = Vec::new();
-    for entry in split_top_level_commas(inner) {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            continue;
-        }
-        // `name:` (required) or `name: <default>` (optional). A colon-less
-        // entry (`**attrs`, or a splat) isn't a plain local — SKIP it, don't
-        // abort the whole header (a `?` here dropped every declared local).
-        let Some(colon) = entry.find(':') else { continue };
-        let name = entry[..colon].trim();
-        if name.is_empty() {
-            continue;
-        }
-        let default_src = entry[colon + 1..].trim();
-        let sym = Symbol::from(name);
-        if default_src.is_empty() {
-            params.push(Param::keyword(sym, None));
-        } else {
-            params.push(Param::keyword(sym, Some(parse_default_literal(default_src))));
-        }
-    }
-    (!params.is_empty()).then_some(params)
-}
-
-/// Split on commas that aren't nested inside `()`/`[]`/`{}` or a string
-/// literal — strict-locals defaults can be `{a: 1}` or `[1, 2]`.
-fn split_top_level_commas(s: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut buf = String::new();
-    let mut depth = 0i32;
-    let mut quote: Option<char> = None;
-    for c in s.chars() {
-        match quote {
-            Some(q) => {
-                buf.push(c);
-                if c == q {
-                    quote = None;
-                }
+    for keyword in parameters.keywords().iter() {
+        if let Some(optional) = keyword.as_optional_keyword_parameter_node() {
+            if contains_query_default(&optional.value()) {
+                return Err(IngestError::Unsupported { file: file.into(), message: "strict-local to_query defaults are not supported".into() });
             }
-            None => match c {
-                '"' | '\'' => {
-                    quote = Some(c);
-                    buf.push(c);
-                }
-                '(' | '[' | '{' => {
-                    depth += 1;
-                    buf.push(c);
-                }
-                ')' | ']' | '}' => {
-                    depth -= 1;
-                    buf.push(c);
-                }
-                ',' if depth == 0 => {
-                    out.push(std::mem::take(&mut buf));
-                }
-                _ => buf.push(c),
-            },
+            let location = optional.value().location();
+            let default_source = std::str::from_utf8(location.as_slice()).map_err(|_| IngestError::Parse {
+                file: file.into(), message: "strict-local default is not UTF-8".into(),
+            })?;
+            params.push(Param::keyword(Symbol::from(constant_id_str(&optional.name())), Some(parse_default_literal(default_source))));
+        } else if let Some(required) = keyword.as_required_keyword_parameter_node() {
+            params.push(Param::keyword(Symbol::from(constant_id_str(&required.name())), None));
         }
     }
-    if !buf.trim().is_empty() {
-        out.push(buf);
-    }
-    out
+    Ok((!params.is_empty()).then_some(params))
 }
 
-/// Parse a strict-locals default's source into a literal `Expr`. Covers
-/// the literals a header default realistically uses; anything else
-/// degrades to `nil`.
+fn strict_local_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\r' | '\n' | '\x0b' | '\x0c')
+}
+
+fn find_strict_locals_header(source: &str) -> Option<&str> {
+    for (start, _) in source.match_indices('#') {
+        let tail = &source[start + 1..];
+        let after_hash = tail.trim_start_matches(strict_local_space);
+        if after_hash.len() == tail.len() { continue; }
+        let Some(after_label) = after_hash.strip_prefix("locals:") else { continue; };
+        let signature = after_label.trim_start_matches(strict_local_space);
+        if signature.len() == after_label.len() { continue; }
+        let Some(inner) = signature.strip_prefix('(') else { continue; };
+        for (end, _) in inner.match_indices(')') {
+            let following = &inner[end + 1..];
+            let rest = following.trim_start_matches(strict_local_space);
+            let whitespace = &following[..following.len() - rest.len()];
+            if rest.strip_prefix('-').unwrap_or(rest).starts_with("%>")
+                || rest.is_empty() || whitespace.contains('\n')
+            {
+                return Some(&inner[..end]);
+            }
+        }
+    }
+    None
+}
+
+fn contains_query_default(node: &ruby_prism::Node<'_>) -> bool {
+    struct QueryCall { found: bool }
+    impl<'pr> ruby_prism::Visit<'pr> for QueryCall {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if node.name().as_slice() == b"to_query" { self.found = true; }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let mut query = QueryCall { found: false };
+    ruby_prism::Visit::visit(&mut query, node);
+    query.found
+}
+
 fn parse_default_literal(s: &str) -> Expr {
     use crate::expr::{ArrayStyle, ExprNode, Literal};
     use crate::span::Span;
@@ -355,8 +332,38 @@ mod tests {
         assert_eq!(ViewEngine::from_extension("jbuilder"), None);
     }
 
+    #[test]
+    fn strict_local_header_matches_pinned_rails_discovery() {
+        let cases = [
+            ("<div>locals:</div>\n<%# locals: (query: { a: \"x\" }.to_query) -%>", Some("query: { a: \"x\" }.to_query")),
+            ("<%# locals: not a signature %>\n<%# locals: (record:) %>", Some("record:")),
+            ("<%# locals: (record:, query: { a: \")\" }.to_query) -%>", Some("record:, query: { a: \")\" }.to_query")),
+            ("<%# locals: (query: { a: '(' }.to_query) -%>", Some("query: { a: '(' }.to_query")),
+            ("<%# locals: (query = {a: \"x\"}.to_query, record:) -%>", Some("query = {a: \"x\"}.to_query, record:")),
+            ("#\tlocals:\t(record:)\nplain", Some("record:")),
+            ("<%# locals:(record:) %>", None),
+            ("<%#locals: (record:) %>", None),
+            ("<%# locals: (first:) %>\n<%# locals: (second:) %>", Some("first:")),
+            ("<%# locals: (query: %q{)}.to_query) -%>", Some("query: %q{)}.to_query")),
+            ("<%# locals: (query: /\\)/.to_query) -%>", Some("query: /\\)/.to_query")),
+            ("<%# locals: (query: \")\nend\" ) -%>", Some("query: \"")),
+            ("<%# locals: (record:) \r\nordinary", Some("record:")),
+            ("<%# locals: (record:)\x0b-%>", Some("record:")),
+            ("<div data-note=\"# locals: (record:)\">text</div>", None),
+            ("literal # locals: (record:)\n<div>plain</div>", Some("record:")),
+            ("<%# locals: (query: \") -%>\".to_query) -%>", Some("query: \"")),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(find_strict_locals_header(source), expected, "{source:?}");
+        }
+    }
+
+    fn test_strict_locals(src: &str) -> Option<Vec<crate::dialect::Param>> {
+        parse_strict_locals(src, "app/views/strict_local_test.html.erb").unwrap()
+    }
+
     fn locals_names(src: &str) -> Vec<String> {
-        parse_strict_locals(src)
+        test_strict_locals(src)
             .unwrap_or_default()
             .iter()
             .map(|p| p.name.as_str().to_string())
@@ -366,7 +373,7 @@ mod tests {
     #[test]
     fn strict_locals_parses_required_and_defaulted() {
         let src = "<%# locals: (comment:, was_merged: false, story: nil) -%>\n<div>";
-        let ps = parse_strict_locals(src).unwrap();
+        let ps = test_strict_locals(src).unwrap();
         assert_eq!(ps.len(), 3);
         assert_eq!(ps[0].name.as_str(), "comment");
         assert!(ps[0].default.is_none()); // required
@@ -378,7 +385,7 @@ mod tests {
         use crate::expr::{ExprNode, Literal};
         // `[]` → a real empty Array; `1.5` → Float; neither degrades to nil.
         let src = "<%# locals: (a: [], b: 1.5, c: :x, d: 3) -%>";
-        let ps = parse_strict_locals(src).unwrap();
+        let ps = test_strict_locals(src).unwrap();
         assert!(matches!(&*ps[0].default.as_ref().unwrap().node, ExprNode::Array { .. }));
         assert!(matches!(
             &*ps[1].default.as_ref().unwrap().node,
@@ -402,11 +409,11 @@ mod tests {
         // A bare `locals:` in a NON-header comment must not scavenge a `(`
         // from later template code and hijack the signature.
         let src = "<%# locals: no parens here %>\n<%= foo(bar) %>";
-        assert_eq!(parse_strict_locals(src), None);
+        assert_eq!(test_strict_locals(src), None);
     }
 
     #[test]
     fn strict_locals_absent_returns_none() {
-        assert_eq!(parse_strict_locals("<div>plain view</div>"), None);
+        assert_eq!(test_strict_locals("<div>plain view</div>"), None);
     }
 }

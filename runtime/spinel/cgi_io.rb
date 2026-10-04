@@ -216,13 +216,17 @@ module CgiIo
   # demo, so byte-by-byte is sufficient.
   def self.url_encode(s)
     out = String.new
-    s.to_s.each_byte do |b|
+    text = s.to_s
+    i = 0
+    while i < text.bytesize
+      b = text.getbyte(i)
       if (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) ||
          b == 45 || b == 46 || b == 95 || b == 126
         out << b.chr
       else
         out << format("%%%02X", b)
       end
+      i += 1
     end
     out
   end
