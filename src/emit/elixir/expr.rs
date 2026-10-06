@@ -678,7 +678,11 @@ fn emit_block_with_value(e: &Expr) -> String {
 
 // ---- expression emit ------------------------------------------------
 
+/// Render an Elixir expression while preserving complete-call primitive semantics.
 pub(super) fn emit_expr(e: &Expr) -> String {
+    if let Some(s) = crate::emit::shared::string_bytes::emit(e, crate::emit::shared::string_bytes::Target::Elixir, emit_expr) {
+        return s;
+    }
     // String-builder hint sites (`io = String.new; io << "..."; io`,
     // tagged by the view/jbuilder lowerer) → the iolist idiom. One hook
     // covers the Append + terminal-Result sites; Init is intercepted in
@@ -2478,6 +2482,7 @@ mod tests {
                 origin: None,
                 constants: Vec::new(),
                 unknown_calls: Vec::new(),
+                class_ivar_initializers: Vec::new(),
             }
         }
         fn const_ref(path: &[&str]) -> Expr {
@@ -2602,6 +2607,7 @@ mod tests {
             origin: None,
             constants: Vec::new(),
             unknown_calls: Vec::new(),
+            class_ivar_initializers: Vec::new(),
         };
         let class = crate::lower::functionalize::functionalize(vec![class]).pop().unwrap();
         let ex = crate::emit::elixir::emit_library_class(&class).expect("emit");
@@ -2838,6 +2844,7 @@ mod tests {
             origin: None,
             constants: Vec::new(),
             unknown_calls: Vec::new(),
+            class_ivar_initializers: Vec::new(),
         };
         clear_modules();
         register_modules(std::iter::once(&vh));

@@ -16,8 +16,11 @@
 //! cross-cutting Prism AST helpers live in [`util`].
 
 mod alba;
+mod graphql_ruby;
+mod class_configuration;
 pub mod allow_browser;
 pub mod app;
+mod concern_accessors;
 pub mod controller;
 pub mod expr;
 pub mod fixture;
@@ -29,6 +32,7 @@ pub mod current_attributes;
 pub mod delegate;
 pub mod thread_mattr;
 pub mod model;
+mod model_macros;
 pub mod on_load_reopen;
 pub mod prism;
 pub mod rate_limit;

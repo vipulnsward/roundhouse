@@ -1,6 +1,7 @@
 # Controller-level cookie access — Rails' `cookies` CookieJar. `cookies[:k]`
-# reads the inbound cookie; `cookies[:k] = v` (and `cookies.permanent[:k] = v`)
-# records a write the dispatcher serializes as Set-Cookie.
+# reads the inbound cookie; `cookies[:k] = v` records a write the dispatcher
+# serializes as Set-Cookie, and `cookies.permanent[:k] = v` records one that
+# expires twenty years out, as Rails' does.
 #
 # Ruby-family only, like current.rb beside this file: a CookieJar-typed field
 # on Base must NOT transpile to the strict targets (they don't exercise
@@ -20,6 +21,10 @@ module ActionController
       @inbound = {}
       @out = {}
       @options = {}
+      @flag_httponly = {}
+      @flag_samesite = {}
+      @flag_secure = {}
+      @flag_expires = {}
       # Copy via `.each` (pair iteration), not `.keys`: the inbound hash is
       # the request's `Tep.str_hash` (a `Hash.new("")`), whose `.keys`
       # intrinsic yields a null array through the loosely-typed `req.cookies`
@@ -42,10 +47,14 @@ module ActionController
       raw_set(key, ActionController::SignedCookieJar.value_of(value))
     end
 
-    # `cookies.permanent[:k] = v` — expiry is not modeled; permanence is a
-    # no-op returning the same jar so the index-assign lands on `[]=`.
+    # `cookies.permanent[:k] = v` — a view whose writes carry Rails'
+    # twenty-year expiry. This returned `self` until 2026-10-06, which
+    # made every "permanent" cookie a session cookie: campfire's sign-in
+    # ended when the browser closed (found running the Deccan Queen on
+    # Rails chat room). A view for the same reason `signed` is one: it
+    # keeps this jar's stores single-assignment.
     def permanent
-      self
+      ActionController::PermanentCookieJar.new(self)
     end
 
     # `cookies.signed[:k]` — a view that signs on the way out and
@@ -94,6 +103,59 @@ module ActionController
       @out[key.to_s]
     end
 
+    def record_flags(key, httponly, same_site, secure)
+      k = key.to_s
+      @flag_httponly[k] = httponly ? "1" : ""
+      ss = same_site.to_s
+      ss = "Lax" if ss == "lax" || ss == "Lax"
+      ss = "Strict" if ss == "strict" || ss == "Strict"
+      ss = "None" if ss == "none" || ss == "None"
+      @flag_samesite[k] = ss
+      @flag_secure[k] = secure ? "1" : ""
+      k
+    end
+
+    # Rails defaults HttpOnly on. A bare `cookies[:k] = v` (or
+    # `cookies.signed[:k] = v`) never calls `record_flags`, so a missing
+    # entry means the default, not an opt-out. Explicit `httponly: false`
+    # records "" and stays off.
+    def flag_httponly?(key)
+      k = key.to_s
+      return true unless @flag_httponly.key?(k)
+      @flag_httponly[k] == "1"
+    end
+
+    def flag_samesite(key)
+      @flag_samesite[key.to_s].to_s
+    end
+
+    def flag_secure?(key)
+      @flag_secure[key.to_s] == "1"
+    end
+
+    # Marks a write as permanent; the `permanent` views call it after
+    # storing the value.
+    def record_permanent(key)
+      k = key.to_s
+      @flag_expires[k] = ActionController::CookieJar.permanent_expires
+      k
+    end
+
+    # The `Expires` a permanent write recorded, as an HTTP date; "" for a
+    # cookie that ends with the browser session, which is every write
+    # that didn't go through `permanent`.
+    def flag_expires(key)
+      @flag_expires[key.to_s].to_s
+    end
+
+    # `20.years.from_now`, which is what Rails' permanent jar writes,
+    # formatted the way Rack writes `expires=`. A calendar twenty years
+    # rather than a count of seconds, as ActiveSupport's `years` is.
+    def self.permanent_expires
+      n = Time.now.utc
+      Time.utc(n.year + 20, n.month, n.day, n.hour, n.min, n.sec).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    end
+
     # Keep the value store String-valued; transport attributes have their
     # own typed map. A deletion expires the browser cookie as well.
     def delete(key, options = {})
@@ -103,12 +165,16 @@ module ActionController
       attributes["Expires"] = "Thu, 01 Jan 1970 00:00:00 GMT"
       @options[key.to_s] = attributes
       @out[key.to_s] = ""
+      @flag_expires.delete(key.to_s)
       ""
     end
 
     def record_options(key, value)
       attributes = { "Path" => "/" }
       if value.is_a?(Hash)
+        ss = value[:same_site]
+        ss = "" if ss.nil?
+        record_flags(key, value[:httponly] != false, ss.to_s, value[:secure] == true)
         attributes["Path"] = value[:path].to_s unless value[:path].nil?
         attributes["HttpOnly"] = "" if value[:httponly] == true
         attributes["Secure"] = "" if value[:secure] == true
@@ -185,8 +251,12 @@ module ActionController
   # signature, a value signed for a different cookie name, and a string
   # that is not of the form at all.
   class SignedCookieJar
-    def initialize(jar)
+    # `permanent` is true for `cookies.signed.permanent` and
+    # `cookies.permanent.signed`: same signing, writes expire with
+    # Rails' twenty years.
+    def initialize(jar, permanent = false)
       @jar = jar
+      @permanent = permanent
     end
 
     # NIL for an absent cookie and for anything that does not verify —
@@ -229,14 +299,13 @@ module ActionController
         "cookie." + key.to_s, ActionController::SignedCookieJar.expiry_of(value), true
       )
       @jar.raw_set(key, signed)
+      @jar.record_permanent(key) if @permanent
       value
     end
 
-    # `cookies.signed.permanent[:k] = v` — permanence is not modeled
-    # (same as the unsigned jar's), so this is the identity that keeps
-    # the index-assign landing on `[]=` above.
+    # `cookies.signed.permanent[:k] = v` — campfire's session cookie.
     def permanent
-      self
+      ActionController::SignedCookieJar.new(@jar, true)
     end
 
     def delete(key, options = {})
@@ -261,6 +330,35 @@ module ActionController
     def self.value_of(value)
       return value[:value].to_s if value.is_a?(Hash)
       value.to_s
+    end
+  end
+
+  # The `cookies.permanent` view: the unsigned jar's reads and writes,
+  # with each write recorded as expiring in twenty years. Rails'
+  # PermanentCookieJar, which is also where `cookies.permanent.signed`
+  # starts.
+  class PermanentCookieJar
+    def initialize(jar)
+      @jar = jar
+    end
+
+    def [](key)
+      @jar.raw(key)
+    end
+
+    def []=(key, value)
+      @jar.record_options(key, value)
+      stored = @jar.raw_set(key, ActionController::SignedCookieJar.value_of(value))
+      @jar.record_permanent(key)
+      stored
+    end
+
+    def signed
+      ActionController::SignedCookieJar.new(@jar, true)
+    end
+
+    def delete(key)
+      @jar.delete(key)
     end
   end
 

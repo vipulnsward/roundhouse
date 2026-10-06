@@ -229,9 +229,10 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
     }
     // Which app-layer roots ingest actually walked — silent for the
     // common one-root case (so the fixtures' expected output stays
-    // unchanged), printed for a Packwerk app so a run proves
-    // `packs/*/app` (or `components/*`, `engines/*`) was in scope
-    // rather than silently limited to the root `app/`.
+    // unchanged), printed for a Packwerk app or one with an in-repo
+    // engine so a run proves `packs/*/app` (or `components/*`,
+    // `engines/*`, `lib/<engine>/app`) was in scope rather than
+    // silently limited to the root `app/`.
     if app.app_roots.len() > 1 {
         const MAX_SHOWN: usize = 8;
         let shown: Vec<&str> = app.app_roots.iter().take(MAX_SHOWN).map(String::as_str).collect();
@@ -248,6 +249,11 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
     // prioritization signal.
     if let Some(census) = &census {
         eprintln!("roundhouse-check: {}", census.summary());
+    }
+    // How much of a graphql-ruby schema the analysis followed, and why
+    // the rest was not: a clean result's denominator.
+    if let Some(coverage) = crate::analyze::graphql::coverage(&app) {
+        eprintln!("roundhouse-check: {}", coverage.summary());
     }
     eprintln!(
         "roundhouse-check: {} — {} parse error(s), {} error(s), {} warning(s), {} gap-attributed note(s), {} survey gap(s)",

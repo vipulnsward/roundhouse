@@ -675,6 +675,30 @@ pub fn collect_relation_class_method_demand(
         if let Some(m) = model_relation_root(r, models, scope_names) {
             out.insert((m, method.clone()));
         }
+        // ...and any receiver the analyzer typed as one of the model's
+        // relations, however it was built: a through-association
+        // (campfire's `Current.user.reachable_messages.search(q)
+        // .last_page_of_matches(100)`) has no foreign key to seed from
+        // and no model constant at its root, so neither syntactic
+        // channel sees it. The relation delegate answers it instead.
+        // The analyzer types a scope's result as `Array[Model]` as often
+        // as `Relation[Model]` (the catalog does not yet tell them
+        // apart), so both count. Demand only registers a class method
+        // the model really has; an Array receiver still has no such
+        // method at runtime, as in Rails.
+        let typed_model = match &r.ty {
+            Some(crate::ty::Ty::Relation { of }) => Some(of),
+            Some(crate::ty::Ty::Array { elem }) => match &**elem {
+                crate::ty::Ty::Class { id, .. } => Some(id),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(of) = typed_model {
+            if models.contains(of) {
+                out.insert((of.clone(), method.clone()));
+            }
+        }
     }
     expr.node.for_each_child(&mut |c| {
         collect_relation_class_method_demand(c, models, scope_names, out)
@@ -717,7 +741,65 @@ pub fn survey_assoc_class_methods(
             &mut model_demand,
         );
     }
-    build_assoc_class_methods(&app.models, assocs, scopes, &demand, &model_demand)
+    // A scope body runs with its relation as the current scope, so a
+    // class method it calls at implicit self runs there too: campfire's
+    // `scope :last_page, -> { last_page_of(PAGE_SIZE) }`
+    // (basecamp/once-campfire#292). Without the demand, `last_page_of`
+    // never took the relation and paged the whole table. The same holds
+    // one call further for a class method that itself takes the
+    // relation, so the demand closes over the registered bodies.
+    let explicit_demand = model_demand.clone();
+    for model in &app.models {
+        for item in &model.body {
+            if let ModelBodyItem::Scope { scope, .. } = item {
+                collect_implicit_self_sends(&scope.body, &model.name, &mut model_demand);
+            }
+        }
+    }
+    loop {
+        let (mut reg, declined) =
+            build_assoc_class_methods(&app.models, assocs, scopes, &demand, &model_demand);
+        // A callee found only at implicit self needs the relation only
+        // when its body uses it. A helper that neither queries nor
+        // creates (campfire's `match_terms`, which quotes search words)
+        // keeps its own signature: no call site reaches it through a
+        // relation, so there is nothing to answer.
+        for (model, per_model) in reg.iter_mut() {
+            per_model.retain(|name, entry| {
+                entry.creates
+                    || entry.queries
+                    || explicit_demand.contains(&(model.clone(), name.clone()))
+            });
+        }
+        reg.retain(|_, per_model| !per_model.is_empty());
+        let before = model_demand.len();
+        for model in &app.models {
+            let Some(per_model) = reg.get(&model.name) else { continue };
+            for item in &model.body {
+                if let ModelBodyItem::Method { method, .. } = item {
+                    if method.receiver == crate::dialect::MethodReceiver::Class
+                        && per_model.contains_key(&method.name)
+                    {
+                        collect_implicit_self_sends(&method.body, &model.name, &mut model_demand);
+                    }
+                }
+            }
+        }
+        if model_demand.len() == before {
+            return (reg, declined);
+        }
+    }
+}
+
+/// `(model, method)` for every receiver-less call in a body that runs
+/// at the model's class level. Most name a scope or a Relation builtin,
+/// which `build_assoc_class_methods` passes over; what it keeps are the
+/// model's own class methods.
+fn collect_implicit_self_sends(expr: &Expr, model: &ClassId, out: &mut HashSet<(ClassId, Symbol)>) {
+    if let ExprNode::Send { recv: None, method, .. } = &*expr.node {
+        out.insert((model.clone(), method.clone()));
+    }
+    expr.node.for_each_child(&mut |c| collect_implicit_self_sends(c, model, out));
 }
 
 /// `(model, method)` for the QUERY-shaped half of that survey — the
@@ -1355,6 +1437,186 @@ pub fn all_scope_names(scopes: &ScopeRegistry) -> HashSet<Symbol> {
     scopes.values().flat_map(|m| m.keys().cloned()).collect()
 }
 
+/// Literal reflective hops on Rails' PUBLIC generated association/scope
+/// surface must be visible to the ordinary relation-threading pass.
+/// Never erase reflection on arbitrary user methods: `send` can call a
+/// private helper where `public_send` and a direct receiver call cannot.
+/// Ingest refuses visibility changes on generated DSL methods without a
+/// local MethodDef; local overrides are vetoed by `app_method` below.
+pub fn ground_literal_model_dispatch(expr: &mut Expr, app: &crate::App, assocs: &AssocRegistry) {
+    expr.node
+        .for_each_child_mut(&mut |child| ground_literal_model_dispatch(child, app, assocs));
+    let ExprNode::Send {
+        recv: Some(recv),
+        method,
+        args,
+        ..
+    } = &mut *expr.node
+    else {
+        return;
+    };
+    if !matches!(method.as_str(), "send" | "__send__" | "public_send") {
+        return;
+    }
+    let Some(Expr { node, .. }) = args.first() else {
+        return;
+    };
+    let name = match &**node {
+        ExprNode::Lit {
+            value: Literal::Sym { value },
+        } => value.clone(),
+        ExprNode::Lit {
+            value: Literal::Str { value },
+        } => Symbol::from(value.as_str()),
+        _ => return,
+    };
+    let Some(ty) = recv.ty.as_ref().map(|ty| ty.peel_nilable()) else {
+        return;
+    };
+    let (id, association) = match ty {
+        crate::ty::Ty::Class { id, .. } => (id, !matches!(&*recv.node, ExprNode::Const { .. })),
+        crate::ty::Ty::Relation { of } => (of, false),
+        crate::ty::Ty::Array { elem } => {
+            let crate::ty::Ty::Class { id, .. } = elem.peel_nilable() else {
+                return;
+            };
+            // An arbitrary Array[Model] is not a Rails collection proxy.
+            // Only the association read the seed arm can reproduce is.
+            let ExprNode::Send {
+                recv: Some(owner),
+                method: aname,
+                args: aargs,
+                block: None,
+                ..
+            } = &*recv.node
+            else {
+                return;
+            };
+            if !aargs.is_empty() {
+                return;
+            }
+            let owner_id = owner.ty.as_ref().and_then(|ty| match ty.peel_nilable() {
+                crate::ty::Ty::Class { id, .. } => Some(id),
+                _ => None,
+            });
+            if !owner_id
+                .and_then(|owner| assocs.has_many_fk(owner, aname))
+                .is_some_and(|(target, _)| target == id)
+            {
+                return;
+            }
+            // Replacing the read with a relation seed bypasses this
+            // reader. It is safe only while the macro-generated reader
+            // still owns the name throughout the recorded ancestry.
+            if owner_id.is_some_and(|owner| {
+                app_method(app, owner, aname, crate::dialect::MethodReceiver::Instance)
+            }) {
+                return;
+            }
+            (id, false)
+        }
+        _ => return,
+    };
+    let Some(model) = app.models.iter().find(|m| &m.name == id) else {
+        return;
+    };
+    let side = if association {
+        crate::dialect::MethodReceiver::Instance
+    } else {
+        crate::dialect::MethodReceiver::Class
+    };
+    // Both calls being collapsed must still be framework-owned. A
+    // dispatcher override changes `send` itself; a target override means
+    // the literal does not select the macro-generated public method.
+    if app_method(app, id, method, side) || app_method(app, id, &name, side) {
+        return;
+    }
+    let generated = if association {
+        args.len() == 1 && model.associations().any(|a| a.name() == &name)
+    } else {
+        model.scopes().any(|s| s.name == name)
+    };
+    if generated {
+        *method = name;
+        args.remove(0);
+    }
+}
+
+/// Whether app metadata proves that `id`'s lookup chain contains a
+/// user-defined method. This deliberately walks models, library classes,
+/// all reopenings, includes, parents and initializer-installed mixins.
+/// Unknown framework roots terminate the walk.
+pub(crate) fn app_method(
+    app: &crate::App,
+    id: &ClassId,
+    name: &Symbol,
+    side: crate::dialect::MethodReceiver,
+) -> bool {
+    fn visit(
+        app: &crate::App,
+        id: &ClassId,
+        name: &Symbol,
+        side: crate::dialect::MethodReceiver,
+        seen: &mut HashSet<ClassId>,
+    ) -> bool {
+        if !seen.insert(id.clone()) {
+            return false;
+        }
+        for model in app.models.iter().filter(|m| &m.name == id) {
+            if model
+                .methods()
+                .any(|m| m.name == *name && m.receiver == side)
+            {
+                return true;
+            }
+            if crate::analyze::model_includes(model)
+                .iter()
+                .any(|inc| visit(app, inc, name, side, seen))
+            {
+                return true;
+            }
+            if model
+                .parent
+                .as_ref()
+                .is_some_and(|p| visit(app, p, name, side, seen))
+            {
+                return true;
+            }
+        }
+        for class in app.library_classes.iter().filter(|c| &c.name == id) {
+            if class
+                .methods
+                .iter()
+                .any(|m| m.name == *name && m.receiver == side)
+            {
+                return true;
+            }
+            if class
+                .includes
+                .iter()
+                .any(|inc| visit(app, inc, name, side, seen))
+            {
+                return true;
+            }
+            if class
+                .parent
+                .as_ref()
+                .is_some_and(|p| visit(app, p, name, side, seen))
+            {
+                return true;
+            }
+        }
+        // Both retained `include` and `prepend` change instance lookup,
+        // not the singleton side. Their order cannot make the proof safer:
+        // the optimization needs every represented override to be absent.
+        side == crate::dialect::MethodReceiver::Instance
+            && app.module_mixins.iter()
+                .filter(|m| m.target == id.0)
+                .any(|m| visit(app, &ClassId(m.module.clone()), name, side, seen))
+    }
+    visit(app, id, name, side, &mut HashSet::new())
+}
+
 /// True if `expr` (or a descendant) calls a method whose name is a scope.
 pub fn mentions_scope(expr: &Expr, names: &HashSet<Symbol>) -> bool {
     let mut found = false;
@@ -1532,7 +1794,7 @@ pub fn mentions_assoc_lookup(expr: &Expr, assocs: &AssocRegistry) -> bool {
                     && matches!(
                         method.as_str(),
                         "offset" | "limit" | "order" | "reorder" | "joins" | "left_outer_joins"
-                            | "includes" | "preload" | "eager_load" | "references" | "group"
+                            | "left_joins" | "includes" | "preload" | "eager_load" | "references" | "group"
                             | "having" | "merge"
                     ));
             if is_where
@@ -1618,6 +1880,8 @@ pub fn mentions_assoc_class_method(
         .any(|(_, m)| acm.values().any(|per_model| per_model.contains_key(m)))
 }
 
+/// True when a model constant starts a Relation chain or a terminal that
+/// requires a Relation seed; used by both whole-app and per-body gates.
 pub fn mentions_model_chain_start(expr: &Expr, models: &HashSet<ClassId>) -> bool {
     let mut found = false;
     fn walk(e: &Expr, models: &HashSet<ClassId>, found: &mut bool) {
@@ -1634,41 +1898,6 @@ pub fn mentions_model_chain_start(expr: &Expr, models: &HashSet<ClassId>) -> boo
             if (is_relation_chain_method(method.as_str())
                 || method.as_str() == "all"
                 || CLASS_ROOT_TERMINALS.contains(&method.as_str()))
-                && const_model(r, models).is_some()
-            {
-                *found = true;
-                return;
-            }
-        }
-        e.node.for_each_child(&mut |c| walk(c, models, found));
-    }
-    walk(expr, models, &mut found);
-    found
-}
-
-/// True when `expr` ends a chain in a terminal that has no home on the
-/// model CLASS (`Push::Subscription.destroy_by(…)`) — the
-/// [`CLASS_ROOT_TERMINALS`] set, on a model constant.
-///
-/// A WHOLE-APP gate, separate from `mentions_model_chain_start`'s
-/// per-body one, because `apply_scope_lowering` returns early for an app
-/// with no scopes, no association-scoped class methods and no
-/// association extensions. That early return is right for everything
-/// else it guards — those all need a registry to be non-empty — and
-/// wrong for these: `destroy_by` on a class reaches nothing whether or
-/// not the app declares a single scope.
-///
-/// Kept to this one set on purpose. Asking the same question about
-/// `where`-family chains would make the early return vacuous for
-/// essentially every app.
-pub fn mentions_class_root_terminal(expr: &Expr, models: &HashSet<ClassId>) -> bool {
-    let mut found = false;
-    fn walk(e: &Expr, models: &HashSet<ClassId>, found: &mut bool) {
-        if *found {
-            return;
-        }
-        if let ExprNode::Send { recv: Some(r), method, .. } = &*e.node {
-            if CLASS_ROOT_TERMINALS.contains(&method.as_str())
                 && const_model(r, models).is_some()
             {
                 *found = true;
@@ -1749,6 +1978,7 @@ fn is_relation_chain_method(name: &str) -> bool {
             | "having"
             | "joins"
             | "left_outer_joins"
+            | "left_joins"
             | "select"
             | "distinct"
             | "includes"
@@ -1781,7 +2011,54 @@ fn is_relation_chain_method(name: &str) -> bool {
             // core_ext) and answers an Array, so the NEXT hop
             // (`with_creator`, a scope) was the one that failed.
             | "without"
+            // `reorder` replaces the ordering gathered so far — a chain
+            // hop like `order`. campfire's `last_page_of_matches`
+            // (basecamp/once-campfire#304) writes it at implicit self
+            // inside a class method that runs against a relation, and
+            // without it here that body never rooted on `__rel` and the
+            // search paged every message in the table.
+            | "reorder"
     )
+}
+
+/// True when `e` is a Relation this pass has already rooted — the
+/// threaded `__rel`, a local holding one, `ActiveRecord::Relation.new`,
+/// or a chain hop off either. Gates `count > n` → `more_than?(n)` so
+/// `Array#count` is left alone.
+fn is_relation_expr(e: &Expr, ctx: &Ctx, locals: &Locals) -> bool {
+    match &*e.node {
+        ExprNode::Var { name, .. } => {
+            locals.rel.contains_key(name)
+                || ctx.scope_body.as_ref().is_some_and(|(_, rel)| rel == name)
+        }
+        ExprNode::Send { method, recv: Some(r), args, block: None, .. } => {
+            if let Some(m) = const_model(r, ctx.models) {
+                if ctx.scope_of(&m, method) {
+                    return true;
+                }
+            }
+            let name = method.as_str();
+            if name == "new"
+                && args.len() == 1
+                && matches!(
+                    &*r.node,
+                    ExprNode::Const { path }
+                        if path.len() == 2
+                            && path[0].as_str() == "ActiveRecord"
+                            && path[1].as_str() == "Relation"
+                )
+            {
+                return true;
+            }
+            let hop = is_relation_chain_method(name)
+                || matches!(
+                    name,
+                    "where_scope" | "preloaded" | "skip_preloading!" | "page" | "per"
+                );
+            hop && is_relation_expr(r, ctx, locals)
+        }
+        _ => false,
+    }
 }
 
 /// Shared lookup tables; `scope_body` is `Some((self_model, rel_param))`
@@ -2525,7 +2802,7 @@ fn lower_relation_args(
 ) -> Vec<Symbol> {
     let mut aliases: Vec<Symbol> = Vec::new();
     match method.as_str() {
-        "joins" | "left_outer_joins" => {
+        "joins" | "left_outer_joins" | "left_joins" => {
             let kind = if method.as_str() == "joins" { "INNER JOIN" } else { "LEFT OUTER JOIN" };
             for a in args {
                 if let Some(sql) = join_spec_sql(model, a, kind, ctx) {
@@ -2667,7 +2944,7 @@ fn lower_relation_args(
 /// (or a chain with no join at all) is left alone.
 fn alias_join_in_chain(expr: &mut Expr, plain: &str, aliased: &str) -> bool {
     let ExprNode::Send { recv, method, args, .. } = &mut *expr.node else { return false };
-    if matches!(method.as_str(), "joins" | "left_outer_joins") {
+    if matches!(method.as_str(), "joins" | "left_outer_joins" | "left_joins") {
         let kind = if method.as_str() == "joins" { "INNER JOIN" } else { "LEFT OUTER JOIN" };
         for a in args.iter_mut() {
             let ExprNode::Lit { value: Literal::Str { value } } = &mut *a.node else { continue };
@@ -2806,7 +3083,13 @@ pub(crate) fn rewrite(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option
             *expr.node = ExprNode::Assign { target, value };
             m
         }
-        ExprNode::Send { .. } => rewrite_send(expr, ctx, locals),
+        ExprNode::Send { .. } => {
+            let model = rewrite_send(expr, ctx, locals);
+            crate::lower::relation_counted_terminal::rewrite_count_gt_when(expr, |rel| {
+                is_relation_expr(rel, ctx, locals)
+            });
+            model
+        }
         _ => {
             // Any other node (If/BoolOp/Case/…): recurse children, keeping
             // the same ctx + locals so the relation thread survives across
@@ -2896,6 +3179,16 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                     let new_args = thread_rel(args, var_expr(span, rel), leading, span);
                     *expr = put(span, Some(const_expr(span, self_model)), method, new_args, block, true);
                     return Some(self_model.clone());
+                }
+                // One of the model's own class methods that takes the
+                // relation (`last_page_of(PAGE_SIZE)` in campfire's
+                // `last_page` scope): it runs against this scope, so it
+                // gets this scope's relation, as a scope call does. What
+                // it answers is the method's own business, not a relation.
+                if let Some(leading) = ctx.assoc_class_method_params(self_model, &method) {
+                    let new_args = thread_rel(args, var_expr(span, rel), Some(leading), span);
+                    *expr = put(span, Some(const_expr(span, self_model)), method, new_args, block, true);
+                    return None;
                 }
                 if is_relation_chain_method(method.as_str()) {
                     // Receiver is the bare `__rel` param — any `joins`
@@ -3555,6 +3848,37 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
             None
         }
     }
+}
+
+/// Hand `rel_param` to every receiver-less call of one of `self_model`'s
+/// class methods that takes the relation — the step the scope-body
+/// rewrite cannot take, because it runs before the call-site demand
+/// that registers those methods is known. Applied at the emit seam to
+/// scope bodies and to the bodies of class methods that take the
+/// relation themselves: in Rails both run with that relation as the
+/// current scope, so a class method they call does too
+/// (basecamp/once-campfire#292's `last_page` -> `last_page_of`).
+pub fn thread_rel_into_class_method_calls(
+    body: &mut Expr,
+    self_model: &ClassId,
+    rel_param: &Symbol,
+    assoc_class_methods: &AssocClassMethods,
+) {
+    let Some(per_model) = assoc_class_methods.get(self_model) else { return };
+    fn walk(e: &mut Expr, rel: &Symbol, per_model: &HashMap<Symbol, AssocScopedMethod>) {
+        e.node.for_each_child_mut(&mut |c| walk(c, rel, per_model));
+        let span = e.span;
+        if let ExprNode::Send { recv: None, method, args, .. } = &mut *e.node {
+            if let Some(entry) = per_model.get(method) {
+                let already = args.iter().any(|a| matches!(&*a.node, ExprNode::Var { name, .. } if name == rel));
+                if !already {
+                    let taken = std::mem::take(args);
+                    *args = thread_rel(taken, var_expr(span, rel), Some(&entry.params), span);
+                }
+            }
+        }
+    }
+    walk(body, rel_param, per_model);
 }
 
 /// Rewrite a scope body: implicit-self query roots thread `rel_param`.

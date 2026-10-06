@@ -11,20 +11,20 @@ is tested — which is the honest measure of how much to trust it.
 |---|---|---|
 | `rust` | Cargo crate (axum, rusqlite) | Rust 1.85+, SQLite library |
 | `go` | Go module | Go 1.24+ |
-| `typescript` | Node package | Node.js 18+ |
+| `typescript` | Node package | Node.js 24+ |
 | `crystal` | shard | Crystal 1.10+, SQLite library |
 | `elixir` | Mix project | Elixir 1.15+ |
 | `kotlin` | Gradle build (JVM) | JDK 17+, Gradle 8+ |
 | `swift` | Swift package | Swift 6+; on Linux `libsqlite3-dev` |
 | `python` | Python project (`uv`) | Python 3.11+, `uv` |
 | `csharp` | .NET solution | .NET SDK 10+ |
-| `ruby` | Ruby tree — the framework runtime in Ruby, no Rails | Ruby 3.4+, bundler, SQLite; Node for the asset build |
+| `ruby` | Ruby tree — the framework runtime in Ruby, no Rails | Ruby [3.4+](../../.ruby-version), bundler, SQLite; Node for the asset build |
 
 All ten serve on `:3000`, speak Action Cable at `/cable`, use SQLite at
 `storage/development.sqlite3`, and are seeded by
 `sqlite3 storage/development.sqlite3 < db/seed.sql`. Each ships the
 app's model and controller tests and a Playwright `e2e/` suite; the
-`sqlite3` CLI and Node.js 18+ are needed for the latter.
+`sqlite3` CLI and Node.js 24+ are needed for the latter.
 
 ## The variations
 
@@ -32,12 +32,17 @@ app's model and controller tests and a Playwright `e2e/` suite; the
 |---|---|
 | `jruby` | The `ruby` emit with prebuilt assets and JRuby run/test commands. JRuby 10+ (JDK 21+). |
 | `spinel` | The `ruby` shape packaged as a `spin` project for ahead-of-time compilation to a native binary. Needs the Spinel compiler; [`spinel.md`](spinel.md). |
-| `typescript-worker` | The `typescript` emit bundled to run in a browser `SharedWorker`, with SQLite compiled to WebAssembly, for the in-browser demos. Node.js 18+ to bundle; no server. |
+| `typescript-worker` | The `typescript` emit bundled to run in a browser `SharedWorker`, with SQLite compiled to WebAssembly, for the in-browser demos. Node.js 24+ to bundle; no server. |
 
 ## How far each is tested
 
-Every claim below is a CI job on every push to `main`, all of them
-against the blog fixture (`fixtures/real-blog`: articles, comments,
+The lanes below run across targets in scheduled full validation, or when
+requested with `ci:full`. Ordinary PRs use a Ruby floor plus targeted
+additions for the files they change. Pushes to canonical `main` run that
+Ruby floor plus the full Spinel suite; extra-language SDKs wait for the
+four-hour schedule. Maintainers can request full PR coverage with `ci:full`.
+See [CI coverage](../ci/README.md). The lanes use the blog fixture
+(`fixtures/real-blog`: articles, comments,
 nested routes, validations, Turbo Streams over Action Cable, Tailwind)
 unless another app is named. A target's row in
 [`RELEASES.md`](../../RELEASES.md) records where these stood at the
@@ -62,8 +67,9 @@ that gap.
 
 ## The conformance bar
 
-A target is on the list above because it passes `compare` on the
-fixture on every push. A page that renders one node differently — an
+The conformance bar is a passing `compare` result against the fixture,
+not the assumption that every target was checked on an ordinary PR.
+A page that renders one node differently — an
 attribute missing, a whitespace text node — is red. That is
 deliberately a higher bar than "the tests pass": it means the emitted
 app is the same app, as a browser or a scraper would see it, not a
