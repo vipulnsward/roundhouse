@@ -37,6 +37,7 @@ fn usage() -> &'static str {
     "\
 Usage: roundhouse --target LANG [INPUT] [-o OUT]
        roundhouse --site [INPUT] [-o OUT]
+       roundhouse --archives LANG,LANG [INPUT] [-o OUT]
        roundhouse check [--continue] [APP]
        roundhouse lsp
        roundhouse mcp [APP]
@@ -60,6 +61,8 @@ Options:
                        Default INPUT=.  Default OUT=./out/<lang>/
       --site           Build all targets + landing-page assets.
                        Default INPUT=fixtures/real-blog  Default OUT=./_site/
+      --archives LIST  Build only comma-separated targets' browse archives.
+                       Same defaults as --site; no website or browser demos.
   -o, --output PATH    Output directory.
       --allow-unsupported
                        Don't fail on unsupported-construct gaps: emit a
@@ -127,6 +130,13 @@ fn cli() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Ok(Action::Archives { targets, input, out }) => match project::build_archives(&input, &out, &targets) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("roundhouse: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Err(e) => {
             eprintln!("roundhouse: {e}");
             eprintln!();
@@ -150,11 +160,17 @@ enum Action {
         input: PathBuf,
         out: PathBuf,
     },
+    Archives {
+        targets: Vec<BuildTarget>,
+        input: PathBuf,
+        out: PathBuf,
+    },
 }
 
 fn parse_args(args: Vec<String>) -> Result<Action, String> {
     let mut target: Option<BuildTarget> = None;
     let mut site = false;
+    let mut archives = None;
     let mut out: Option<PathBuf> = None;
     let mut allow_unsupported = false;
     let mut survey = false;
@@ -166,6 +182,15 @@ fn parse_args(args: Vec<String>) -> Result<Action, String> {
             "-h" | "--help" => return Ok(Action::Help),
             "-V" | "--version" => return Ok(Action::Version),
             "--site" => site = true,
+            "--archives" => {
+                let value = iter.next().ok_or("--archives requires a target list")?;
+                let targets = value.split(',').map(|name| {
+                    BuildTarget::from_str(name)
+                        .filter(|t| BuildTarget::ALL.contains(t))
+                        .ok_or_else(|| format!("unknown archive target '{name}'"))
+                }).collect::<Result<Vec<_>, _>>()?;
+                archives = Some(targets);
+            }
             "--allow-unsupported" => allow_unsupported = true,
             "--survey" => survey = true,
             "-t" | "--target" => {
@@ -201,6 +226,16 @@ fn parse_args(args: Vec<String>) -> Result<Action, String> {
         ));
     }
 
+    if let Some(targets) = archives {
+        if target.is_some() || site || allow_unsupported || survey {
+            return Err("--archives cannot be combined with --target, --site, --survey or --allow-unsupported".into());
+        }
+        return Ok(Action::Archives {
+            targets,
+            input: positional.pop().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("fixtures/real-blog")),
+            out: out.unwrap_or_else(|| PathBuf::from("_site")),
+        });
+    }
     match (target, site) {
         (Some(_), true) => Err("--target and --site are mutually exclusive".into()),
         (None, false) => Err("one of --target LANG or --site is required".into()),
@@ -422,6 +457,15 @@ fn run_transpile(
     let errors = diags.iter().filter(|d| d.severity == Severity::Error).count();
     let type_errors = analyze_diags.iter().filter(|d| d.severity == Severity::Error).count();
     if errors + type_errors > 0 {
+        // A project-boundary refusal (`target_files` returned `Err`, e.g.
+        // a Date column on a target without a date-only runtime) fails
+        // with or without the flag, so suggesting it would be false.
+        // Name the refusal instead (issue #303).
+        if let Err(e) = &files_result {
+            return Err(format!(
+                "{errors} unsupported/syntax error(s), {type_errors} type error(s) — {e}"
+            ));
+        }
         return Err(format!(
             "{errors} unsupported/syntax error(s), {type_errors} type error(s) — rerun \
              with --allow-unsupported to write the output anyway"
@@ -437,7 +481,7 @@ fn run_transpile(
     // `String`), so before this they were dropped without a word.
     let assets = project::write_binary_assets(&app.binary_assets, &files, out)?;
     eprintln!(
-        "roundhouse: wrote {} files to {} ({})",
+        "roundhouse: emitted {} files to {} ({})",
         files.len() + assets,
         out.display(),
         target.as_str()

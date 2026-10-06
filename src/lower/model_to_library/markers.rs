@@ -34,7 +34,7 @@ use super::{fn_sig, seq, with_ty};
 /// instantiated, and ApplicationRecord's lowered shape is tested
 /// against the abstract-marker-only baseline.
 pub(super) fn push_dom_prefix_method(methods: &mut Vec<MethodDef>, model: &Model) {
-    if is_abstract_class(model) {
+    if is_primary_abstract_class(model) {
         return;
     }
     let prefix = crate::naming::snake_case(model.name.0.as_str());
@@ -134,7 +134,7 @@ pub(super) fn push_dom_prefix_method(methods: &mut Vec<MethodDef>, model: &Model
 /// strict targets never apply — so campfire's avatar helper
 /// (`Zlib.crc32(user.to_param)`) 500'd every avatar on the binary.
 pub(super) fn push_to_param_method(methods: &mut Vec<MethodDef>, model: &Model) {
-    if is_abstract_class(model) {
+    if is_primary_abstract_class(model) {
         return;
     }
     if methods
@@ -195,7 +195,7 @@ pub(super) fn push_to_param_method(methods: &mut Vec<MethodDef>, model: &Model) 
 /// `@id.to_s`. Runs after `push_user_methods` so the check can see the
 /// model's own `to_key` in the accumulated list.
 pub(super) fn push_dom_record_key_method(methods: &mut Vec<MethodDef>, model: &Model) {
-    if is_abstract_class(model) {
+    if is_primary_abstract_class(model) {
         return;
     }
     let has_to_key = methods
@@ -254,11 +254,10 @@ pub(super) fn push_dom_record_key_method(methods: &mut Vec<MethodDef>, model: &M
     });
 }
 
-/// True when the model body declares `primary_abstract_class` (Rails'
-/// way of marking ApplicationRecord-shaped abstract bases). Per-model
-/// synthesizers that emit instance-shaped methods skip these classes
-/// since they're never instantiated.
-fn is_abstract_class(model: &Model) -> bool {
+/// Primary abstract bases omit instance-shaped synthesis, unless a later
+/// literal marker makes them concrete. Intermediate abstract bases still
+/// emit methods for their concrete children to inherit.
+fn is_primary_abstract_class(model: &Model) -> bool {
     model.body.iter().any(|item| {
         if let ModelBodyItem::Unknown { expr, .. } = item {
             if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node {
@@ -266,7 +265,32 @@ fn is_abstract_class(model: &Model) -> bool {
             }
         }
         false
-    })
+    }) && is_abstract_class(model)
+}
+
+/// Literal abstract markers take effect in declaration order. Admission
+/// requires a concrete includer; production separately checks whether
+/// the model is a primary base before suppressing inherited methods.
+pub(super) fn is_abstract_class(model: &Model) -> bool {
+    let mut abstract_class = false;
+    for item in &model.body {
+        if let ModelBodyItem::Unknown { expr, .. } = item {
+            if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node {
+                if args.is_empty() && method.as_str() == "primary_abstract_class" {
+                    abstract_class = true;
+                }
+            } else if let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*expr.node {
+                if matches!(&*recv.node, ExprNode::SelfRef) && method.as_str() == "abstract_class=" {
+                    if let [arg] = args.as_slice() {
+                        if let ExprNode::Lit { value: Literal::Bool { value } } = &*arg.node {
+                            abstract_class = *value;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    abstract_class
 }
 
 /// `attr_accessor :vote` / `attr_reader :x` / `attr_writer :y` on a model
@@ -356,7 +380,7 @@ pub(crate) fn declared_attr_names(model: &Model) -> Vec<Symbol> {
 }
 
 pub(super) fn push_attr_accessor_methods(methods: &mut Vec<MethodDef>, model: &Model) {
-    if is_abstract_class(model) {
+    if is_primary_abstract_class(model) {
         return;
     }
     for item in &model.body {
@@ -381,13 +405,12 @@ pub(super) fn push_attr_accessor_methods(methods: &mut Vec<MethodDef>, model: &M
         //
         // A `def` of the same name REPLACES the accessor — Ruby's last
         // definition wins, and `attr_accessor :foo` is a definition.
-        // Checking only `methods` is not enough: the user's own bodies
-        // arrive later via `push_user_methods`, which DROPS a name a
-        // synthesizer already claimed. So an accessor pushed here for a
-        // name the model defines silently deletes the app's method and
-        // leaves `def foo; @foo; end` in its place — the ivar the app
-        // memoizes into is then never written and the reader answers nil
-        // forever.
+        // Checking only `methods` is not enough: without yielding here,
+        // an accessor pushed for a name the model defines is later
+        // eligible for replacement by `push_user_methods` only when it
+        // still has the bare-ivar attr_* shape; skipping the push when
+        // `model_defines_instance_method` is the primary gate so the
+        // app's memo body is what `methods` carries.
         //
         // Measured on campfire's `Opengraph::Location`, which declares
         // `attr_accessor :url, :parsed_url` and then memoizes
@@ -496,7 +519,7 @@ pub(crate) fn attribute_api_decls(body: &[ModelBodyItem]) -> Vec<(Symbol, Symbol
 /// synthesizers run before `push_user_methods`, which drops
 /// collisions — same dance as attr_accessor).
 pub(super) fn push_attribute_api_methods(methods: &mut Vec<MethodDef>, model: &Model) {
-    if is_abstract_class(model) {
+    if is_primary_abstract_class(model) {
         return;
     }
     for (name, ty_sym) in attribute_api_decls(&model.body) {
@@ -899,7 +922,7 @@ fn push_belongs_to_defaults(methods: &mut Vec<MethodDef>, model: &Model) {
 /// suffix is dropped. Such a record can only be invalidated by its key
 /// changing, which is Rails' exposure too.
 pub(super) fn push_cache_key_methods(methods: &mut Vec<MethodDef>, model: &Model, schema: &Schema) {
-    if is_abstract_class(model) {
+    if is_primary_abstract_class(model) {
         return;
     }
     // NO TABLE, NO KEY — and for an STI subclass that is the point, not
@@ -1223,9 +1246,9 @@ pub(super) fn push_callback_methods(methods: &mut Vec<MethodDef>, model: &Model)
 /// `on:` restrictions lower structurally: `after_commit ..., on:
 /// :create` targets the runtime's `after_create_commit` hook, and
 /// validation hooks get a `new_record?` guard (accurate at validation
-/// time — the insert hasn't happened yet). Ingest already rejected
-/// every (hook, on) pair this match doesn't cover, plus `if:`/
-/// `unless:` conditions.
+/// time — the insert hasn't happened yet). `if:`/`unless:` conditions
+/// wrap the body in the guard they name. Ingest already rejected every
+/// (hook, on) pair this match doesn't cover.
 fn push_symbol_callback(
     methods: &mut Vec<MethodDef>,
     model: &Model,
@@ -1234,9 +1257,6 @@ fn push_symbol_callback(
 ) {
     use crate::dialect::{CallbackHook as Hook, CallbackOn as On};
 
-    if cb.condition.is_some() {
-        return;
-    }
     let hook_name = match (cb.hook, cb.on) {
         (Hook::AfterCommit, Some(On::Create)) => "after_create_commit",
         (Hook::AfterCommit, Some(On::Update)) => "after_update_commit",
@@ -1256,17 +1276,30 @@ fn push_symbol_callback(
         )
     };
 
+    let mut body = seq(cb.targets.iter().map(self_call).collect());
     if matches!(cb.hook, Hook::BeforeValidation | Hook::AfterValidation) && cb.on.is_some() {
         // Validations never run on destroy; ingest rejects this.
         let Some(on) = cb.on else { return };
-        let body = seq(cb.targets.iter().map(self_call).collect());
-        let Some(body) = guard_validation_on(body, on, span) else { return };
-        fold_into_or_push(methods, model, hook_name, body);
-    } else {
-        for target in &cb.targets {
-            fold_into_or_push(methods, model, hook_name, self_call(target));
-        }
+        let Some(guarded) = guard_validation_on(body, on, span) else { return };
+        body = guarded;
     }
+    // `if:` / `unless:` — the callback runs only when the condition
+    // holds, exactly as Rails. The condition was already negated for
+    // `unless:` at ingest.
+    if let Some(cond) = &cb.condition {
+        body = Expr::new(
+            span,
+            ExprNode::If {
+                cond: cond.clone(),
+                then_branch: body,
+                else_branch: Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Lit { value: Literal::Nil },
+                ),
+            },
+        );
+    }
+    fold_into_or_push(methods, model, hook_name, body);
 }
 
 /// Wrap a validation-hook body in the `new_record?` guard its `on:`

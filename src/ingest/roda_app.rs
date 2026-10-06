@@ -69,6 +69,7 @@ pub fn is_roda_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> bool {
 /// `views/`, `app.rb`, `seeds.rb`.
 pub fn ingest_roda_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult<App> {
     super::sources::reset();
+    let _source_root = super::sources::set_root(dir);
     let mut app = App::new();
 
     // Schema — Sequel apps have no schema.rb; fold migrations in
@@ -354,6 +355,7 @@ fn ingest_roda_class(source: &[u8], file: &str, app: &mut App) -> IngestResult<S
             origin: None,
             constants: Vec::new(),
             unknown_calls: Vec::new(),
+            class_ivar_initializers: Vec::new(),
         });
     }
 

@@ -60,7 +60,9 @@ oracle: the same URL fetched from Rails and from each target must
 produce the same response — emitted tests, a differential compare
 against live Rails (DOM node for DOM node, JSON value for value), and
 browser end-to-end tests for what a static diff can't reach — and
-every target on the list passes it on every push. →
+the full target matrix runs in scheduled validation, with a Ruby floor
+and targeted additions on pull requests (canonical `main` keeps Ruby
+plus Spinel). →
 [`--target`](docs/guide/transpile.md) · [targets](docs/guide/targets.md)
 · [what of Rails comes through](docs/guide/rails-coverage.md) ·
 [verifying](docs/guide/verifying.md)
@@ -73,9 +75,11 @@ compiled targets it has the closest behavior to Rails by a distance,
 and will for the foreseeable future, because it runs the framework
 runtime itself rather than a translation of it. Basecamp's Campfire
 runs this way — every page and every cable frame compared against
-live Rails on every push, and a
+live Rails in the full validation cycle, and a
 [Docker archive](https://rubys.github.io/roundhouse/apps/campfire.html)
-you can run in minutes. → [Spinel](docs/guide/spinel.md)
+you can run in minutes. [OCRAN](https://github.com/Largo/ocran), the
+Ruby application packager, does the whole compile in one command:
+`ocran --roundhouse path/to/app`. → [Spinel](docs/guide/spinel.md)
 
 ## Get it
 
@@ -106,7 +110,7 @@ the prerequisites.
 - [**Campfire**](https://rubys.github.io/roundhouse/apps/campfire.html)
   — the compiled product, as a Docker archive.
 - [**Browse**](https://rubys.github.io/roundhouse/browse/) — what every
-  emitter produces from the blog fixture, updated on each push.
+  emitter produces from the blog fixture, refreshed by scheduled full validation.
 - [**Bench**](https://rubys.github.io/roundhouse/bench/) — throughput,
   memory and latency across the live targets on a fixed box, against
   Rails as it ships.
@@ -150,10 +154,11 @@ Using it: the [user guide](docs/guide/README.md) — one page per door
 above, starting at [install](docs/guide/install.md) — and
 [`RELEASES.md`](RELEASES.md).
 
-Working on it: [`DEVELOPMENT.md`](DEVELOPMENT.md) (build, test, the
-`bin/rh` workflow runner, debugging tools, repo map),
-[`AGENTS.md`](AGENTS.md) (the invariants not to break), and
-[`docs/`](docs/README.md) — the architecture: the compiler's
+Working on it: [`DEVELOPMENT.md`](DEVELOPMENT.md) is the short entry to the
+[development handbook](docs/development/README.md);
+[`AGENTS.md`](AGENTS.md) holds the invariants and
+[CI for contributors](docs/ci/README.md) explains hosted checks.
+[`docs/`](docs/README.md) maps the architecture: the compiler's
 [inputs](docs/data/), the [pipeline](docs/pipeline/) (analyze, lower,
 emit, runtime, verification), and the working plans.
 [`BETS.md`](BETS.md) is why this attempt is shaped differently from
@@ -167,16 +172,18 @@ its predecessors; [`WHY.md`](WHY.md) is why do it at all.
 
 ## Contributing
 
-Issues and pull requests are both welcome, and a PR does not need a
-conversation first: CI runs the whole matrix on every pull request —
-the unit suite, each target's toolchain, the DOM compare against live
-Rails, the Spinel lanes — so a change you can only test partially on
-your machine is tested fully there. The `unit` job gates; the Spinel
-and Campfire jobs marked `continue-on-error` track moving toolchains,
-and red there is a signal to read, not a check to make pass. Setup,
-the test cycle, and what a PR should carry are in
-[`DEVELOPMENT.md`](DEVELOPMENT.md); the invariants not to break are in
-[`AGENTS.md`](AGENTS.md).
+Issues and pull requests are welcome; a PR does not need a conversation first.
+Include a repro, a regression test, and what you verified. Start with
+[contributor setup](docs/development/README.md) and the
+[invariants](AGENTS.md). CI selects a Ruby floor plus targeted checks;
+see [CI for contributors](docs/ci/README.md) to request full/fresh validation
+and interpret advisory results. PR validation never deploys Pages.
+
+Contributors also have a chat room. It is Campfire, compiled by
+Roundhouse and running on Spinel, so everyone in it is also testing
+it. The invite link isn't posted publicly; if you have opened an issue
+or pull request and would like to join, say so there and you'll get an
+invite privately.
 
 ## License
 

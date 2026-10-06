@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use super::super::EmittedFile;
 use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver};
+use crate::expr::{Expr, ExprNode, Literal, RESOLVED_DATA_FACTORY};
 use crate::ty::{Param, ParamKind, Ty};
 
 /// Emit an `.rbs` sidecar for a single `LibraryClass`. The output
@@ -66,6 +67,10 @@ fn render_class(lc: &LibraryClass) -> String {
         writeln!(s).unwrap();
     }
 
+    for (name, value) in &lc.constants {
+        render_data_factory(&mut s, lc, name.as_str(), value, &body_pad);
+    }
+
     for m in &lc.methods {
         let line = render_method(m, &segments);
         writeln!(s, "{body_pad}{line}").unwrap();
@@ -76,6 +81,27 @@ fn render_class(lc: &LibraryClass) -> String {
     }
 
     s
+}
+
+fn render_data_factory(s: &mut String, owner: &LibraryClass, name: &str, value: &Expr, pad: &str) {
+    if value.decisions & RESOLVED_DATA_FACTORY == 0 {
+        return;
+    }
+    let Some(Ty::Class { id, args: type_args }) = &value.ty else { return };
+    if !type_args.is_empty() || id.0.as_str() != format!("{}::{name}", owner.name.0.as_str()) {
+        return;
+    }
+    let ExprNode::Send { args, .. } = &*value.node else { return };
+    let Some(members) = args.iter().map(|arg| match &*arg.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str()),
+        _ => None,
+    }).collect::<Option<Vec<_>>>() else { return };
+    writeln!(s, "{pad}class {name} < ::Data").unwrap();
+    writeln!(s, "{pad}  def self.new: (*untyped, **untyped) -> instance").unwrap();
+    for member in members {
+        writeln!(s, "{pad}  def `{member}`: () -> untyped").unwrap();
+    }
+    writeln!(s, "{pad}end").unwrap();
 }
 
 fn render_method(m: &MethodDef, enclosing: &[&str]) -> String {
@@ -176,7 +202,13 @@ fn render_typed_params(params: &[Param], enclosing: &[&str]) -> String {
     let mut parts = Vec::new();
     for p in params {
         let name = p.name.as_str();
-        let mut ty = ty_to_rbs_in(&p.ty, enclosing);
+        // IR keyword-rest params name the collected Hash, while RBS
+        // **T names the type of each keyword value (see rbs ingestion).
+        let param_ty = match (&p.kind, &p.ty) {
+            (ParamKind::KeywordRest, Ty::Hash { value, .. }) => &**value,
+            _ => &p.ty,
+        };
+        let mut ty = ty_to_rbs_in(param_ty, enclosing);
         // A parameter whose every observed call site passed nil is not a
         // `nil`-typed parameter: seeded as such, spinel refuses the method
         // ("param has unsupported type nil"). Widen to untyped.
@@ -372,4 +404,20 @@ pub(super) fn emit_library_class_rbs_decls(app: &crate::App) -> Vec<EmittedFile>
             emit_library_class_rbs(lc, &rb_path)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ident::Symbol;
+
+    #[test]
+    fn keyword_rest_renders_values_not_a_nested_hash() {
+        let hash = Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Str) };
+        let params = [
+            Param { name: Symbol::from("mapping"), ty: hash.clone(), kind: ParamKind::Required },
+            Param { name: Symbol::from("opts"), ty: hash, kind: ParamKind::KeywordRest },
+        ];
+        assert_eq!(render_typed_params(&params, &[]), "Hash[Symbol, String] mapping, **String opts");
+    }
 }

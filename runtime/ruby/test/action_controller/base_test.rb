@@ -90,11 +90,22 @@ class ActionControllerBaseTest < Minitest::Test
     assert_equal "https://deccanqueenonrails.com/chat/login?state=nonce", @controller.location
   end
 
-  def test_redirect_to_rejects_unsupported_host_protection_before_responding
-    assert_raises(NotImplementedError) { @controller.redirect_to("https://attacker.example", allow_other_host: false) }
+  def test_redirect_to_rejects_cross_host_before_responding
+    assert_raises(ArgumentError) { @controller.redirect_to("https://attacker.example", allow_other_host: false) }
     assert_nil @controller.location
     refute @controller.performed?
     assert_equal 200, @controller.status
+  end
+
+  def test_redirect_to_defaults_to_cross_host_protection
+    assert_raises(ArgumentError) { @controller.redirect_to("https://attacker.example") }
+    assert_nil @controller.location
+    refute @controller.performed?
+  end
+
+  def test_redirect_to_sanitizes_control_characters_even_for_an_allowed_issuer
+    @controller.redirect_to("https://deccanqueenonrails.com/chat/login?state=nonce\r\n\0", allow_other_host: true)
+    assert_equal "https://deccanqueenonrails.com/chat/login?state=nonce", @controller.location
   end
 
   def test_redirect_to_propagates_notice_to_flash
